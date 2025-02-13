@@ -2,8 +2,10 @@
 
 import os
 import datetime
+import chess
 from ChessRL import ChessRL, ChessPolicyNet
 import torch
+import random
 import os
 import numpy as np
 import torch
@@ -15,6 +17,59 @@ else:
     print("GPU not available, using CPU instead.")
 import matplotlib.pyplot as plt
 
+
+def reinforce_update(policy_net, optimizer, gamma=0.99):
+    """
+    Perform a REINFORCE update using the move history stored in policy_net.move_history.
+
+    Each move entry should contain:
+      - 'log_prob': A tensor containing the log probability (requires grad).
+      - 'points': The reward for that move.
+
+    Args:
+        policy_net: The policy network instance (e.g., for White or Black).
+        optimizer: The optimizer to update policy_net parameters.
+        gamma (float): Discount factor.
+
+    Returns:
+        float: The loss value.
+    """
+    # 1. Extract rewards from the move history.
+    rewards = [entry['points'] for entry in policy_net.move_history]
+
+    # 2. Compute cumulative discounted rewards (returns).
+    returns_list = []
+    R = 0
+    for r in reversed(rewards):
+        R = r + gamma * R
+        returns_list.insert(0, R)
+
+    # Create the returns tensor on the same device as the model.
+    returns = torch.tensor(returns_list, dtype=torch.float32, device=policy_net.board_tensor.device)
+    # Squeeze the returns tensor so that each element is a scalar.
+    returns = returns.squeeze()
+
+    # Optionally normalize returns.
+    returns = (returns - returns.mean()) / (returns.std() + 1e-9)
+
+    # 3. Compute the REINFORCE loss.
+    loss = 0
+    for i, entry in enumerate(policy_net.move_history):
+        # Squeeze the log probability so that it is a scalar.
+        log_prob = entry['log_prob'].squeeze()
+        loss += -log_prob * returns[i].squeeze()  # Ensure both are scalars.
+
+    # 4. Backpropagate and update the network.
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    loss_val = loss.item()
+    print(f"REINFORCE loss: {loss_val:.4f}")
+
+    # Clear the move history for the next batch.
+    policy_net.move_history = []
+    return loss_val
 
 # Now you can define your helper functions here
 def play_self_game(policy_net_white, policy_net_black, terminal_reward=100, terminal_loss=100,
@@ -150,8 +205,6 @@ def train_chess_policy_networks(
     black_avg_points = []
     white_loss_list = []
     black_loss_list = []
-    white_avg_entropy = []
-    black_avg_entropy = []
     white_avg_log_probs = []
     black_avg_log_probs = []
     game_length_list = []
@@ -197,16 +250,22 @@ def train_chess_policy_networks(
         black_avg = np.mean([entry['points'] for entry in batch_black_move_history])
         white_avg_points.append(white_avg)
         black_avg_points.append(black_avg)
-
-        white_entropies = [compute_entropy(entry['probs']) for entry in batch_white_move_history if entry['probs'] is not None]
-        black_entropies = [compute_entropy(entry['probs']) for entry in batch_black_move_history if entry['probs'] is not None]
-        white_avg_entropy.append(np.mean(white_entropies) if white_entropies else 0)
-        black_avg_entropy.append(np.mean(black_entropies) if black_entropies else 0)
-
+        # Instead of:
         white_log_probs = [entry['log_prob'].item() for entry in batch_white_move_history if entry['log_prob'] is not None]
-        black_log_probs = [entry['log_prob'].item() for entry in batch_black_move_history if entry['log_prob'] is not None]
         white_avg_log_probs.append(np.mean(white_log_probs) if white_log_probs else 0)
-        black_avg_log_probs.append(np.mean(black_log_probs) if black_log_probs else 0)
+
+        # Do this:
+        log_prob_list = [entry['log_prob'] for entry in batch_white_move_history if entry['log_prob'] is not None]
+        if log_prob_list:
+            # Stack the list of tensors into one tensor
+            white_log_probs_tensor = torch.stack(log_prob_list)
+            # Compute the mean in one vectorized operation
+            white_avg_log = white_log_probs_tensor.mean().item()
+        else:
+            white_avg_log = 0.0
+
+        white_avg_log_probs.append(white_avg_log)
+
 
         avg_game_length = np.mean(game_lengths)
         game_length_list.append(avg_game_length)
@@ -271,8 +330,6 @@ def train_chess_policy_networks(
         "black_loss_list": black_loss_list,
         "white_avg_points": white_avg_points,
         "black_avg_points": black_avg_points,
-        "white_avg_entropy": white_avg_entropy,
-        "black_avg_entropy": black_avg_entropy,
         "white_avg_log_probs": white_avg_log_probs,
         "black_avg_log_probs": black_avg_log_probs,
         "game_length_list": game_length_list,
@@ -322,8 +379,6 @@ def plot_training_metrics_binned(metrics, num_bins=20):
             - black_loss_list
             - white_avg_points
             - black_avg_points
-            - white_avg_entropy
-            - black_avg_entropy
             - white_avg_log_probs
             - black_avg_log_probs
             - game_length_list
@@ -356,17 +411,6 @@ def plot_training_metrics_binned(metrics, num_bins=20):
     axs[0, 1].set_title("Binned Average Points per Iteration")
     axs[0, 1].legend()
     axs[0, 1].grid(True)
-
-    # 3. Binned Average Entropy per Iteration.
-    iterations, white_avg_entropy_means, white_avg_entropy_stds = bin_data(metrics['white_avg_entropy'], num_bins)
-    _, black_avg_entropy_means, black_avg_entropy_stds = bin_data(metrics['black_avg_entropy'], num_bins)
-    axs[0, 2].errorbar(iterations, white_avg_entropy_means, yerr=white_avg_entropy_stds, marker='o', color='blue', label='White Avg Entropy')
-    axs[0, 2].errorbar(iterations, black_avg_entropy_means, yerr=black_avg_entropy_stds, marker='o', color='red', label='Black Avg Entropy')
-    axs[0, 2].set_xlabel("Iteration")
-    axs[0, 2].set_ylabel("Avg Entropy")
-    axs[0, 2].set_title("Binned Average Entropy per Iteration")
-    axs[0, 2].legend()
-    axs[0, 2].grid(True)
 
     # 4. Binned Average Log Probabilities per Iteration.
     iterations, white_avg_log_probs_means, white_avg_log_probs_stds = bin_data(metrics['white_avg_log_probs'], num_bins)
@@ -406,13 +450,16 @@ def plot_training_metrics_binned(metrics, num_bins=20):
 def print_custom_board(board):
     """
     Prints the chess board with a fixed-width for each square.
-    Each piece is shown with a preceding 'w' for white and 'b' for black,
-    centered in a 4-character wide field. Empty squares are shown as '.'.
+    Each piece is shown with a preceding 'white ' for white pieces and 'black ' for black pieces,
+    centered in an 8-character wide field.
+    Empty squares are shown as '.'.
     The board is printed from rank 8 to 1.
     """
-    # Loop over the ranks (8 to 1)
+    cell_width = 8  # Increase the width to accommodate "white " or "black " + piece symbol
+
+    # Loop over the ranks from 8 down to 1.
     for rank in range(7, -1, -1):
-        # Start the row string with the rank number
+        # Create the row starting with the rank number and two spaces.
         row_str = f"{rank+1}  "
         for file in range(8):
             sq = chess.square(file, rank)
@@ -420,18 +467,21 @@ def print_custom_board(board):
             if piece is None:
                 cell_str = "."
             else:
-                color = "w" if piece.color == chess.WHITE else "b"
-                symbol = piece.symbol().upper()
-                cell_str = f"{color}{symbol}"
-            # Center the cell_str in a field of width 4
-            row_str += f"{cell_str:^4}"
+                # Prepend with 'white ' or 'black ' and append the piece symbol (upper-case)
+                if piece.color == chess.WHITE:
+                    cell_str = f"white {piece.symbol().upper()}"
+                else:
+                    cell_str = f"black {piece.symbol().upper()}"
+            # Center the cell string in a field of width cell_width
+            row_str += f"{cell_str:^{cell_width}}"
         print(row_str)
 
-    # Print the file letters at the bottom.
-    file_str = "    "  # initial padding to align with the board
+    # Compute the left margin based on the rank label (e.g. "8  " is 3 characters).
+    label_width = len(f"{8}  ")
+    file_str = " " * label_width
     for file in range(8):
         file_letter = chr(ord('a') + file)
-        file_str += f"{file_letter:^4}"
+        file_str += f"{file_letter:^{cell_width}}"
     print(file_str)
     print()
 
