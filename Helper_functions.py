@@ -407,11 +407,9 @@ def print_custom_board(board):
 
 
 def play_human_vs_bot(white_model_path, black_model_path, human_color=None,
-                      device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
+                      use_minimax=False, minimax_depth=3):
     """
     Play a game of chess between a human and the bot.
-    
-    The function loads the appropriate pretrained model based on the bot's color.
     
     Parameters:
         white_model_path (str): Path to the pretrained model file for White.
@@ -419,19 +417,20 @@ def play_human_vs_bot(white_model_path, black_model_path, human_color=None,
         human_color (chess.WHITE or chess.BLACK or None): The color you wish to play.
             If set to None, the bot's color is chosen at random, and you play the opposite.
         device (torch.device): The device on which to load the model.
+        use_minimax (bool): If True, the bot will use minimax search to select its moves.
+        minimax_depth (int): The depth to search when using minimax.
         
     Behavior:
         - If human_color is provided, the bot plays the opposite color.
         - If human_color is None, a random color is chosen for the bot.
     
-    Assumes that:
-        - A function `print_custom_board(board)` is available to print the board.
-        - The classes `ChessRL` and `ChessPolicyNet` are defined and imported.
+    Assumes:
+        - A function `print_custom_board(board)` exists for displaying the board.
+        - The classes `ChessRL` and `ChessPolicyNet` have been defined and imported.
     
     Returns:
         None
     """
-    # Initialize the chess board.
     board = chess.Board()
     
     # Determine colors.
@@ -445,7 +444,7 @@ def play_human_vs_bot(white_model_path, black_model_path, human_color=None,
     print("You play as:", "White" if human_color == chess.WHITE else "Black")
     print()
 
-    # Create the policy network for the bot based on its color and load the appropriate model.
+    # Create the policy network for the bot and load the appropriate model.
     if bot_color == chess.WHITE:
         policy_net = ChessPolicyNet(
             num_actions=len(ChessRL.action_space),
@@ -466,13 +465,18 @@ def play_human_vs_bot(white_model_path, black_model_path, human_color=None,
 
     # Game loop.
     while not board.is_game_over():
-        # Print the current board (ensure print_custom_board is defined/imported).
+        # Display the current board.
         print_custom_board(board)
         
         if board.turn == bot_color:
             # Bot's turn.
             policy_net.update_board(board)
-            move = policy_net.choose_move()
+            if use_minimax:
+                # Use the minimax branch in choose_move.
+                move = policy_net.choose_move(use_minimax=use_minimax, minimax_depth=minimax_depth)
+            else:
+                # Use the default RL-based move selection.
+                move = policy_net.choose_move()
             
             if move not in board.legal_moves:
                 print("Selected move is illegal! (Something is wrong with masking.)")
