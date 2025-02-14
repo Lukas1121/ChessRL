@@ -83,14 +83,14 @@ class ChessRL:
         [-10, -20, -20, -20, -20, -20, -20, -10],
         [ 20,  20,   0,   0,   0,   0,  20,  20],
         [ 20,  30,  10,   0,   0,  10,  30,  20]
-    ], dtype=torch.float)
+    ], dtype=torch.float) / 10
     PIECE_VALUES = {
         chess.PAWN: 1,
         chess.KNIGHT: 3,
         chess.BISHOP: 3,
         chess.ROOK: 5,
         chess.QUEEN: 9,
-        chess.KING: 50,
+        chess.KING: 20,
     }
     action_space = [chess.Move(from_sq, to_sq) for from_sq in chess.SQUARES for to_sq in chess.SQUARES]
 
