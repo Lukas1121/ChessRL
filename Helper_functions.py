@@ -80,7 +80,6 @@ def play_self_game(policy_net_white, policy_net_black, terminal_reward=100, term
     Returns:
         tuple: (white_move_history, black_move_history, game_length, result)
     """
-    import chess  # Ensure chess is imported if not already done globally
     board = chess.Board()
     
     while not board.is_game_over():
@@ -90,32 +89,35 @@ def play_self_game(policy_net_white, policy_net_black, terminal_reward=100, term
 
         if board.turn == chess.WHITE:
             policy_net_white.update_board(board)
-            previous_material = policy_net_white.compute_material_score()
             move = policy_net_white.choose_move()
             if move not in board.legal_moves:
                 continue
+
+            # Check if the move is a capture
+            is_capture = board.is_capture(move)
+
             board.push(move)
             policy_net_white.update_board(board)
-            current_material = policy_net_white.compute_material_score()
-            material_change = current_material - previous_material
-            if material_change == 0:
+
+            if not is_capture:
                 policy_net_white.move_history[-1]['points'] += policy_net_white.non_capture_penalty
         else:
             policy_net_black.update_board(board)
-            previous_material = policy_net_black.compute_material_score()
             move = policy_net_black.choose_move()
             if move not in board.legal_moves:
                 continue
+
+            # Check if the move is a capture
+            is_capture = board.is_capture(move)
+
             board.push(move)
             policy_net_black.update_board(board)
-            current_material = policy_net_black.compute_material_score()
-            material_change = current_material - previous_material
-            if material_change == 0:
+
+            # Apply penalty if no capture occurred
+            if not is_capture:
                 policy_net_black.move_history[-1]['points'] += policy_net_black.non_capture_penalty
 
-    print("Game over!")
     result = board.result()
-    print("Result:", result)
     
     game_length = len(policy_net_white.move_history)
     length_penalty = per_move_penalty * game_length
