@@ -2,7 +2,7 @@
 
 import os
 import chess
-from ChessRL import ChessRL, ChessPolicyNet
+from ChessRL import ChessRL, ChessPolicyNet, reinforce_update
 import torch
 import random
 import os
@@ -15,60 +15,6 @@ else:
     device = torch.device("cpu")
     print("GPU not available, using CPU instead.")
 import matplotlib.pyplot as plt
-
-
-def reinforce_update(policy_net, optimizer, gamma=0.99):
-    """
-    Perform a REINFORCE update using the move history stored in policy_net.move_history.
-
-    Each move entry should contain:
-      - 'log_prob': A tensor containing the log probability (requires grad).
-      - 'points': The reward for that move.
-
-    Args:
-        policy_net: The policy network instance (e.g., for White or Black).
-        optimizer: The optimizer to update policy_net parameters.
-        gamma (float): Discount factor.
-
-    Returns:
-        float: The loss value.
-    """
-    # 1. Extract rewards from the move history.
-    rewards = [entry['points'] for entry in policy_net.move_history]
-
-    # 2. Compute cumulative discounted rewards (returns).
-    returns_list = []
-    R = 0
-    for r in reversed(rewards):
-        R = r + gamma * R
-        returns_list.insert(0, R)
-
-    # Create the returns tensor on the same device as the model.
-    returns = torch.tensor(returns_list, dtype=torch.float32, device=policy_net.board_tensor.device)
-    # Squeeze the returns tensor so that each element is a scalar.
-    returns = returns.squeeze()
-
-    # Optionally normalize returns.
-    returns = (returns - returns.mean()) / (returns.std() + 1e-9)
-
-    # 3. Compute the REINFORCE loss.
-    loss = 0
-    for i, entry in enumerate(policy_net.move_history):
-        # Squeeze the log probability so that it is a scalar.
-        log_prob = entry['log_prob'].squeeze()
-        loss += -log_prob * returns[i].squeeze()  # Ensure both are scalars.
-
-    # 4. Backpropagate and update the network.
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-
-    loss_val = loss.item()
-    print(f"REINFORCE loss: {loss_val:.4f}")
-
-    # Clear the move history for the next batch.
-    policy_net.move_history = []
-    return loss_val
 
 # Now you can define your helper functions here
 def play_self_game(policy_net_white, policy_net_black, terminal_reward=100, terminal_loss=100,
@@ -84,7 +30,6 @@ def play_self_game(policy_net_white, policy_net_black, terminal_reward=100, term
     
     while not board.is_game_over():
         if len(policy_net_white.move_history) >= move_length_threshold:
-            print("Move threshold exceeded. Forcing game end.")
             break
 
         if board.turn == chess.WHITE:
