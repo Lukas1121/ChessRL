@@ -1,0 +1,4 @@
+implement lookahead as a hybrid approach
+    - have model pick top n possible moves
+    - minmax/lookahead algo then investigates best possible outcome of the 5 based on depth param 
+    - the chosen move is then chosen based on best outcome (score difference)

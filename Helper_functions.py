@@ -407,7 +407,7 @@ def print_custom_board(board):
 
 
 def play_human_vs_bot(white_model_path, black_model_path, human_color=None,
-                      use_minimax=False, minimax_depth=3):
+                      use_lookahead=False, minimax_depth=1,top_n=3):
     """
     Play a game of chess between a human and the bot.
     
@@ -471,9 +471,9 @@ def play_human_vs_bot(white_model_path, black_model_path, human_color=None,
         if board.turn == bot_color:
             # Bot's turn.
             policy_net.update_board(board)
-            if use_minimax:
+            if use_lookahead:
                 # Use the minimax branch in choose_move.
-                move = policy_net.choose_move(use_minimax=use_minimax, minimax_depth=minimax_depth)
+                move = policy_net.choose_move(use_lookahead=use_lookahead, minimax_depth=minimax_depth,top_n=top_n)
             else:
                 # Use the default RL-based move selection.
                 move = policy_net.choose_move()
