@@ -215,19 +215,19 @@ def train_chess_policy_networks(
         print(f"  White Avg Points: {white_avg:.2f}, Black Avg Points: {black_avg:.2f}")
         print(f"  White Win Rate: {win_rate_white:.2f}, Black Win Rate: {win_rate_black:.2f}, Draw Rate: {draw_rate:.2f}\n")
 
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        run_num = 1
-        while os.path.exists(os.path.join(base_dir, f"run{run_num}")):
-            run_num += 1
-        save_folder = os.path.join(base_dir, f"run{run_num}")
-        os.makedirs(save_folder, exist_ok=True)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    run_num = 1
+    while os.path.exists(os.path.join(base_dir, f"run{run_num}")):
+        run_num += 1
+    save_folder = os.path.join(base_dir, f"run{run_num}")
+    os.makedirs(save_folder, exist_ok=True)
 
-        white_save_path = os.path.join(save_folder, "policy_net_white.pth")
-        black_save_path = os.path.join(save_folder, "policy_net_black.pth")
+    white_save_path = os.path.join(save_folder, "policy_net_white.pth")
+    black_save_path = os.path.join(save_folder, "policy_net_black.pth")
 
-        torch.save(policy_net_white.state_dict(), white_save_path)
-        torch.save(policy_net_black.state_dict(), black_save_path)
-        print("Models saved in folder:", save_folder)
+    torch.save(policy_net_white.state_dict(), white_save_path)
+    torch.save(policy_net_black.state_dict(), black_save_path)
+    print("Models saved in folder:", save_folder)
 
     params = {
         "num_iterations": num_iterations,
