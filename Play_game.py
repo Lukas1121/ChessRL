@@ -6,5 +6,5 @@ white_model_path = "run2\policy_net_white.pth"
 black_model_path = "run2\policy_net_black.pth"
 
 # Optionally, specify your color (e.g., chess.WHITE); if None, colors are assigned at random.
-play_human_vs_bot(white_model_path, black_model_path, human_color=chess.WHITE)
+play_human_vs_bot(white_model_path, black_model_path, human_color=chess.WHITE,use_minimax=True,minimax_depth=5)
 

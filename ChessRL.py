@@ -12,6 +12,7 @@ else:
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as D
+from minmax import get_best_move
 
 class ChessRL:
     pawn_table = torch.tensor([
@@ -234,16 +235,43 @@ class ChessPolicyNet(nn.Module, ChessRL):
         probs = F.softmax(masked_logits, dim=-1)
         return probs
 
-    def choose_move(self):
-        # With probability epsilon, choose a random legal move.
+    def choose_move(self, use_minimax=False, minimax_depth=3):
+        """
+        Choose a move using either the RL network (with exploration) or minimax search.
+        
+        Args:
+            use_minimax (bool): If True, use the minimax algorithm to select the move.
+            minimax_depth (int): Depth to search if using minimax.
+        
+        Returns:
+            chess.Move: The selected move.
+        """
+        if use_minimax:
+            # Use minimax search with a depth limit. We pass a lambda wrapper for our evaluation function.
+            move = get_best_move(self.board, minimax_depth, lambda board: self.compute_material_score(board))
+            
+            # Log the minimax move. Since minimax is not differentiable, we log a dummy log_prob.
+            dummy_log_prob = torch.tensor(0.0, device=self.board_tensor.device)
+            points = self.compute_material_score()
+            self.move_history.append({
+                'state_tensor': self.board_tensor,
+                'probs': None,
+                'action_index': None,
+                'move': move,
+                'log_prob': dummy_log_prob,
+                'points': points,
+                'minimax': True  # Mark that this move was chosen via minimax.
+            })
+            return move
+
+        # Otherwise, proceed with the RL-based move selection.
         if np.random.rand() < self.epsilon:
             # Obtain legal moves from the board.
             legal_moves = list(self.board.legal_moves)
             # Randomly choose one.
             move = random.choice(legal_moves)
 
-            # Optionally, log that this was a random move.
-            # Here, we log a dummy log probability (or you might mark it in the history).
+            # Log that this was a random move.
             dummy_log_prob = torch.tensor(0.0, device=self.board_tensor.device)
             points = self.compute_material_score()
             self.move_history.append({
@@ -257,7 +285,7 @@ class ChessPolicyNet(nn.Module, ChessRL):
             })
             return move
         else:
-            # Otherwise, use the policy network to select a move.
+            # Use the policy network to select a move.
             probs = self.forward()  # Expected shape: (1, num_actions)
             m = D.Categorical(probs)
             action = m.sample()      # Keep this as a tensor.
@@ -279,6 +307,7 @@ class ChessPolicyNet(nn.Module, ChessRL):
             })
 
             return move
+
 
 def reinforce_update(policy_net, optimizer, gamma=0.99):
     """
