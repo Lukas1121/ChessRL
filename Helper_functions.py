@@ -1,7 +1,6 @@
 # Helper_functions.py
 
 import os
-import datetime
 import chess
 from ChessRL import ChessRL, ChessPolicyNet
 import torch
@@ -157,8 +156,6 @@ def train_chess_policy_networks(
     exceeding_length_penalty=1000,
     pretrained_model_path_white=None,
     pretrained_model_path_black=None,
-    save_path_white="policy_net_white.pth",
-    save_path_black="policy_net_black.pth",
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ):
     """
@@ -250,21 +247,6 @@ def train_chess_policy_networks(
         black_avg = np.mean([entry['points'] for entry in batch_black_move_history])
         white_avg_points.append(white_avg)
         black_avg_points.append(black_avg)
-        # Instead of:
-        white_log_probs = [entry['log_prob'].item() for entry in batch_white_move_history if entry['log_prob'] is not None]
-        white_avg_log_probs.append(np.mean(white_log_probs) if white_log_probs else 0)
-
-        # Do this:
-        log_prob_list = [entry['log_prob'] for entry in batch_white_move_history if entry['log_prob'] is not None]
-        if log_prob_list:
-            # Stack the list of tensors into one tensor
-            white_log_probs_tensor = torch.stack(log_prob_list)
-            # Compute the mean in one vectorized operation
-            white_avg_log = white_log_probs_tensor.mean().item()
-        else:
-            white_avg_log = 0.0
-
-        white_avg_log_probs.append(white_avg_log)
 
 
         avg_game_length = np.mean(game_lengths)
@@ -286,16 +268,19 @@ def train_chess_policy_networks(
         print(f"  White Avg Points: {white_avg:.2f}, Black Avg Points: {black_avg:.2f}")
         print(f"  White Win Rate: {win_rate_white:.2f}, Black Win Rate: {win_rate_black:.2f}, Draw Rate: {draw_rate:.2f}\n")
 
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_folder = os.path.join(os.path.dirname(save_path_white), f"run_{timestamp}")
-    os.makedirs(save_folder, exist_ok=True)
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        run_num = 1
+        while os.path.exists(os.path.join(base_dir, f"run{run_num}")):
+            run_num += 1
+        save_folder = os.path.join(base_dir, f"run{run_num}")
+        os.makedirs(save_folder, exist_ok=True)
 
-    white_save_path = os.path.join(save_folder, "policy_net_white.pth")
-    black_save_path = os.path.join(save_folder, "policy_net_black.pth")
+        white_save_path = os.path.join(save_folder, "policy_net_white.pth")
+        black_save_path = os.path.join(save_folder, "policy_net_black.pth")
 
-    torch.save(policy_net_white.state_dict(), white_save_path)
-    torch.save(policy_net_black.state_dict(), black_save_path)
-    print("Models saved in folder:", save_folder)
+        torch.save(policy_net_white.state_dict(), white_save_path)
+        torch.save(policy_net_black.state_dict(), black_save_path)
+        print("Models saved in folder:", save_folder)
 
     params = {
         "num_iterations": num_iterations,
@@ -312,8 +297,6 @@ def train_chess_policy_networks(
         "exceeding_length_penalty": exceeding_length_penalty,
         "pretrained_model_path_white": pretrained_model_path_white,
         "pretrained_model_path_black": pretrained_model_path_black,
-        "save_path_white": save_path_white,
-        "save_path_black": save_path_black,
         "device": str(device)
     }
 
@@ -388,7 +371,7 @@ def plot_training_metrics_binned(metrics, num_bins=20):
         num_bins (int): Number of bins into which the iterations will be grouped.
     """
     # Set up a 2x3 grid for plotting.
-    fig, axs = plt.subplots(2, 3, figsize=(18, 10))
+    fig, axs = plt.subplots(2, 2, figsize=(18, 10))
 
     # 1. Binned REINFORCE Loss for White and Black.
     iterations, white_loss_means, white_loss_stds = bin_data(metrics['white_loss_list'], num_bins)
@@ -412,16 +395,6 @@ def plot_training_metrics_binned(metrics, num_bins=20):
     axs[0, 1].legend()
     axs[0, 1].grid(True)
 
-    # 4. Binned Average Log Probabilities per Iteration.
-    iterations, white_avg_log_probs_means, white_avg_log_probs_stds = bin_data(metrics['white_avg_log_probs'], num_bins)
-    _, black_avg_log_probs_means, black_avg_log_probs_stds = bin_data(metrics['black_avg_log_probs'], num_bins)
-    axs[1, 0].errorbar(iterations, white_avg_log_probs_means, yerr=white_avg_log_probs_stds, marker='o', color='blue', label='White Avg Log Prob')
-    axs[1, 0].errorbar(iterations, black_avg_log_probs_means, yerr=black_avg_log_probs_stds, marker='o', color='red', label='Black Avg Log Prob')
-    axs[1, 0].set_xlabel("Iteration")
-    axs[1, 0].set_ylabel("Avg Log Prob")
-    axs[1, 0].set_title("Binned Average Log Probability per Iteration")
-    axs[1, 0].legend()
-    axs[1, 0].grid(True)
 
     # 5. Binned Average Game Length per Iteration.
     iterations, game_length_means, game_length_stds = bin_data(metrics['game_length_list'], num_bins)
@@ -435,14 +408,14 @@ def plot_training_metrics_binned(metrics, num_bins=20):
     iterations, white_win_rates_means, white_win_rates_stds = bin_data(metrics['white_win_rates'], num_bins)
     _, black_win_rates_means, black_win_rates_stds = bin_data(metrics['black_win_rates'], num_bins)
     _, draw_rates_means, draw_rates_stds = bin_data(metrics['draw_rates'], num_bins)
-    axs[1, 2].errorbar(iterations, white_win_rates_means, yerr=white_win_rates_stds, marker='o', color='blue', label='White Win Rate')
-    axs[1, 2].errorbar(iterations, black_win_rates_means, yerr=black_win_rates_stds, marker='o', color='red', label='Black Win Rate')
-    axs[1, 2].errorbar(iterations, draw_rates_means, yerr=draw_rates_stds, marker='o', color='green', label='Draw Rate')
-    axs[1, 2].set_xlabel("Iteration")
-    axs[1, 2].set_ylabel("Rate")
-    axs[1, 2].set_title("Binned Win/Loss/Draw Rates per Iteration")
-    axs[1, 2].legend()
-    axs[1, 2].grid(True)
+    axs[1, 0].errorbar(iterations, white_win_rates_means, yerr=white_win_rates_stds, marker='o', color='blue', label='White Win Rate')
+    axs[1, 0].errorbar(iterations, black_win_rates_means, yerr=black_win_rates_stds, marker='o', color='red', label='Black Win Rate')
+    axs[1, 0].errorbar(iterations, draw_rates_means, yerr=draw_rates_stds, marker='o', color='green', label='Draw Rate')
+    axs[1, 0].set_xlabel("Iteration")
+    axs[1, 0].set_ylabel("Rate")
+    axs[1, 0].set_title("Binned Win/Loss/Draw Rates per Iteration")
+    axs[1, 0].legend()
+    axs[1, 0].grid(True)
 
     plt.tight_layout()
     plt.show()

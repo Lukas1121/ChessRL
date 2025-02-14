@@ -1,5 +1,4 @@
 # chessRL.py
-import os
 import random
 import chess
 import numpy as np
@@ -91,7 +90,7 @@ class ChessRL:
         chess.BISHOP: 3,
         chess.ROOK: 5,
         chess.QUEEN: 9,
-        chess.KING: 20,
+        chess.KING: 50,
     }
     action_space = [chess.Move(from_sq, to_sq) for from_sq in chess.SQUARES for to_sq in chess.SQUARES]
 
