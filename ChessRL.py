@@ -14,6 +14,53 @@ import torch.nn.functional as F
 import torch.distributions as D
 from minmax import get_best_move
 
+
+def create_action_space():
+    """
+    Create a complete action space for chess moves including:
+    - Basic moves (all from-square to to-square combinations)
+    - Pawn promotion moves (for both White and Black)
+    - Castling moves (which are generated in the basic moves)
+    
+    Returns:
+        list[chess.Move]: A list of chess.Move objects representing the full action space.
+    """
+    action_space = []
+    
+    # 1. Basic moves: Iterate over all possible from and to squares.
+    for from_sq in chess.SQUARES:
+        for to_sq in chess.SQUARES:
+            move = chess.Move(from_sq, to_sq)
+            if move not in action_space:
+                action_space.append(move)
+    
+    # 2. Add promotion moves for White:
+    # White pawn promotions occur when a pawn moves from rank 7 (index 6) to rank 8 (index 7).
+    for from_sq in chess.SQUARES:
+        if chess.square_rank(from_sq) == 6:  # White pawn on 7th rank (0-indexed)
+            for to_sq in chess.SQUARES:
+                if chess.square_rank(to_sq) == 7:  # Destination is 8th rank
+                    # Typically a pawn moves straight ahead or diagonally.
+                    if abs(chess.square_file(from_sq) - chess.square_file(to_sq)) <= 1:
+                        for promo in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
+                            promo_move = chess.Move(from_sq, to_sq, promotion=promo)
+                            if promo_move not in action_space:
+                                action_space.append(promo_move)
+    
+    # 3. Add promotion moves for Black:
+    # Black pawn promotions occur when a pawn moves from rank 2 (index 1) to rank 1 (index 0).
+    for from_sq in chess.SQUARES:
+        if chess.square_rank(from_sq) == 1:  # Black pawn on 2nd rank
+            for to_sq in chess.SQUARES:
+                if chess.square_rank(to_sq) == 0:  # Destination is 1st rank
+                    if abs(chess.square_file(from_sq) - chess.square_file(to_sq)) <= 1:
+                        for promo in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
+                            promo_move = chess.Move(from_sq, to_sq, promotion=promo)
+                            if promo_move not in action_space:
+                                action_space.append(promo_move)
+    
+    return action_space
+
 class ChessRL:
     pawn_table = torch.tensor([
     [   0,    0,    0,    0,    0,    0,    0,    0],
@@ -93,7 +140,7 @@ class ChessRL:
         chess.QUEEN: 9,
         chess.KING: 20,
     }
-    action_space = [chess.Move(from_sq, to_sq) for from_sq in chess.SQUARES for to_sq in chess.SQUARES]
+    action_space = create_action_space()
 
     def __init__(self, board, color):
         self.board = board
@@ -203,13 +250,15 @@ class ChessRL:
         self.last_material_score = current_score
 
 class ChessPolicyNet(nn.Module, ChessRL):
-    def __init__(self, num_actions, board, color, non_capture_penalty=-0.2, epsilon=0.1):
+    def __init__(self, board, color, non_capture_penalty=-0.2, epsilon=0.1):
         nn.Module.__init__(self)
         ChessRL.__init__(self, board, color)
         # Define convolutional layers:
         self.conv1 = nn.Conv2d(in_channels=12, out_channels=32, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
-        # Define fully connected layers:
+
+        num_actions = len(ChessRL.action_space)
+        
         self.fc1 = nn.Linear(64 * 8 * 8, 512)
         self.fc2 = nn.Linear(512, num_actions)
 
@@ -235,15 +284,17 @@ class ChessPolicyNet(nn.Module, ChessRL):
         probs = F.softmax(masked_logits, dim=-1)
         return probs
     
-    def _minimax(self, board, depth, maximizing):
+    def _minimax(self, board, depth, alpha, beta, maximizing):
         """
-        A basic minimax search that uses the network's evaluation function.
-        
+        Minimax search with alpha-beta pruning.
+
         Args:
             board (chess.Board): The board state to evaluate.
-            depth (int): How many plies (half-moves) to search.
-            maximizing (bool): True if the current layer is maximizing.
-            
+            depth (int): How many plies to search.
+            alpha (float): The best already explored option along the path to the root for the maximizer.
+            beta (float): The best already explored option along the path to the root for the minimizer.
+            maximizing (bool): True if the current node is a maximizing node.
+        
         Returns:
             float: The evaluation score.
         """
@@ -255,21 +306,27 @@ class ChessPolicyNet(nn.Module, ChessRL):
             max_eval = -float('inf')
             for move in board.legal_moves:
                 board.push(move)
-                eval_value = self._minimax(board, depth - 1, False)
+                eval_value = self._minimax(board, depth - 1, alpha, beta, False)
                 board.pop()
                 max_eval = max(max_eval, eval_value)
+                alpha = max(alpha, eval_value)
+                if beta <= alpha:
+                    break  # Beta cutoff
             return max_eval
         else:
             min_eval = float('inf')
             for move in board.legal_moves:
                 board.push(move)
-                eval_value = self._minimax(board, depth - 1, True)
+                eval_value = self._minimax(board, depth - 1, alpha, beta, True)
                 board.pop()
                 min_eval = min(min_eval, eval_value)
+                beta = min(beta, eval_value)
+                if beta <= alpha:
+                    break  # Alpha cutoff
             return min_eval
 
 
-    def choose_move(self, use_lookahead=True, minimax_depth=2, top_n=3):
+    def choose_move(self, use_lookahead=True, minmax_depth=2, top_n=3):
         """
         Choose a move using either the RL network directly or a hybrid lookahead that
         evaluates the top N moves with a minimax search.
@@ -308,7 +365,7 @@ class ChessPolicyNet(nn.Module, ChessRL):
             # Evaluate each candidate with minimax.
             for idx, move in zip(candidate_indices, candidate_moves):
                 self.board.push(move)
-                eval_value = self._minimax(self.board, minimax_depth, maximizing=(self.board.turn == self.color))
+                eval_value = self._minimax(self.board, minmax_depth, -float('inf'), float('inf'), maximizing=(self.board.turn == self.color))
                 self.board.pop()
                 if best_move is None:
                     best_move = move

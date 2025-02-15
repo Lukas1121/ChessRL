@@ -35,7 +35,7 @@ def play_self_game(policy_net_white, policy_net_black, terminal_reward=100, term
 
         if board.turn == chess.WHITE:
             policy_net_white.update_board(board)
-            move = policy_net_white.choose_move(use_lookahead=use_lookahead,minimax_depth=minmax_depth,top_n=top_n)
+            move = policy_net_white.choose_move(use_lookahead=use_lookahead,minmax_depth=minmax_depth,top_n=top_n)
             if move not in board.legal_moves:
                 continue
 
@@ -49,7 +49,7 @@ def play_self_game(policy_net_white, policy_net_black, terminal_reward=100, term
                 policy_net_white.move_history[-1]['points'] += policy_net_white.non_capture_penalty
         else:
             policy_net_black.update_board(board)
-            move = policy_net_black.choose_move(use_lookahead=use_lookahead,minimax_depth=minmax_depth,top_n=top_n)
+            move = policy_net_black.choose_move(use_lookahead=use_lookahead,minmax_depth=minmax_depth,top_n=top_n)
             if move not in board.legal_moves:
                 continue
 
@@ -115,7 +115,6 @@ def train_chess_policy_networks(
     """
     # Instantiate networks using classes from ChessRL.py
     policy_net_white = ChessPolicyNet(
-        num_actions=len(ChessRL.action_space),
         board=chess.Board(),
         color=chess.WHITE,
         non_capture_penalty=non_capture_penalty,
@@ -123,7 +122,6 @@ def train_chess_policy_networks(
     ).to(device)
 
     policy_net_black = ChessPolicyNet(
-        num_actions=len(ChessRL.action_space),
         board=chess.Board(),
         color=chess.BLACK,
         non_capture_penalty=non_capture_penalty,
@@ -180,7 +178,7 @@ def train_chess_policy_networks(
                 move_length_threshold=move_length_threshold,
                 exceeding_length_penalty=exceeding_length_penalty,
                 use_lookahead=use_lookahead,
-                minimax_depth=minmax_depth,
+                minmax_depth=minmax_depth,
                 top_n=top_n
             )
             batch_white_move_history.extend(wm_history)
@@ -452,14 +450,12 @@ def play_human_vs_bot(white_model_path, black_model_path, human_color=None,
     # Create the policy network for the bot and load the appropriate model.
     if bot_color == chess.WHITE:
         policy_net = ChessPolicyNet(
-            num_actions=len(ChessRL.action_space),
             board=board,
             color=chess.WHITE
         ).to(device)
         policy_net.load_state_dict(torch.load(white_model_path, map_location=device))
     else:
         policy_net = ChessPolicyNet(
-            num_actions=len(ChessRL.action_space),
             board=board,
             color=chess.BLACK
         ).to(device)
