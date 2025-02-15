@@ -18,7 +18,8 @@ import matplotlib.pyplot as plt
 
 # Now you can define your helper functions here
 def play_self_game(policy_net_white, policy_net_black, terminal_reward=100, terminal_loss=100,
-                   per_move_penalty=0, move_length_threshold=200, exceeding_length_penalty=100):
+                   per_move_penalty=0, move_length_threshold=200, exceeding_length_penalty=100,
+                   use_lookahead=False,minmax_depth=2,top_n=3):
     """
     Play a self-play game between two policy networks, forcefully ending the game
     if it exceeds move_length_threshold, and adjust terminal rewards accordingly.
@@ -34,7 +35,7 @@ def play_self_game(policy_net_white, policy_net_black, terminal_reward=100, term
 
         if board.turn == chess.WHITE:
             policy_net_white.update_board(board)
-            move = policy_net_white.choose_move()
+            move = policy_net_white.choose_move(use_lookahead=use_lookahead,minimax_depth=minmax_depth,top_n=top_n)
             if move not in board.legal_moves:
                 continue
 
@@ -48,7 +49,7 @@ def play_self_game(policy_net_white, policy_net_black, terminal_reward=100, term
                 policy_net_white.move_history[-1]['points'] += policy_net_white.non_capture_penalty
         else:
             policy_net_black.update_board(board)
-            move = policy_net_black.choose_move()
+            move = policy_net_black.choose_move(use_lookahead=use_lookahead,minimax_depth=minmax_depth,top_n=top_n)
             if move not in board.legal_moves:
                 continue
 
@@ -101,6 +102,9 @@ def train_chess_policy_networks(
     non_capture_penalty=-1,
     move_length_threshold=200,
     exceeding_length_penalty=1000,
+    use_lookahead=False,
+    minmax_depth=2,
+    top_n=3,
     pretrained_model_path_white=None,
     pretrained_model_path_black=None,
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -109,7 +113,6 @@ def train_chess_policy_networks(
     Train chess policy networks using self-play and the REINFORCE algorithm.
     (Documentation omitted for brevity)
     """
-    import chess  # Ensure chess is imported if not already
     # Instantiate networks using classes from ChessRL.py
     policy_net_white = ChessPolicyNet(
         num_actions=len(ChessRL.action_space),
@@ -175,7 +178,10 @@ def train_chess_policy_networks(
                 terminal_reward=terminal_reward,
                 terminal_loss=terminal_loss,
                 move_length_threshold=move_length_threshold,
-                exceeding_length_penalty=exceeding_length_penalty
+                exceeding_length_penalty=exceeding_length_penalty,
+                use_lookahead=use_lookahead,
+                minimax_depth=minmax_depth,
+                top_n=top_n
             )
             batch_white_move_history.extend(wm_history)
             batch_black_move_history.extend(bm_history)
@@ -244,7 +250,6 @@ def train_chess_policy_networks(
         "exceeding_length_penalty": exceeding_length_penalty,
         "pretrained_model_path_white": pretrained_model_path_white,
         "pretrained_model_path_black": pretrained_model_path_black,
-        "device": str(device)
     }
 
     params_file = os.path.join(save_folder, "parameters.txt")

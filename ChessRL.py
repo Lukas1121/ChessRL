@@ -269,7 +269,7 @@ class ChessPolicyNet(nn.Module, ChessRL):
             return min_eval
 
 
-    def choose_move(self, use_lookahead=False, minimax_depth=2, top_n=5):
+    def choose_move(self, use_lookahead=True, minimax_depth=2, top_n=3):
         """
         Choose a move using either the RL network directly or a hybrid lookahead that
         evaluates the top N moves with a minimax search.
@@ -283,62 +283,65 @@ class ChessPolicyNet(nn.Module, ChessRL):
             chess.Move: The selected move.
         """
         if use_lookahead:
-            # 1. Run a forward pass through the network.
+            # Run a forward pass to get probabilities.
             probs = self.forward()  # Shape: (1, num_actions)
             probs_np = probs.cpu().detach().numpy().flatten()
-
             top_indices = probs_np.argsort()[-top_n:][::-1]  # Sorted descending
 
-            # 3. Filter for legal moves.
+            # Filter for legal moves.
             candidate_moves = []
+            candidate_indices = []
             for idx in top_indices:
                 move = self.action_space[idx]
                 if move in self.board.legal_moves:
                     candidate_moves.append(move)
-            # Fallback: if none of the top moves are legal, use all legal moves.
+                    candidate_indices.append(idx)
             if not candidate_moves:
                 candidate_moves = list(self.board.legal_moves)
+                # If using all legal moves, get their indices:
+                candidate_indices = [self.action_space.index(move) for move in candidate_moves]
 
             best_move = None
             best_eval = None
+            best_index = None
 
-            # 4. Evaluate each candidate using a minimax search.
-            for move in candidate_moves:
-                # Push the candidate move onto the board.
+            # Evaluate each candidate with minimax.
+            for idx, move in zip(candidate_indices, candidate_moves):
                 self.board.push(move)
-                # Evaluate using minimax search.
                 eval_value = self._minimax(self.board, minimax_depth, maximizing=(self.board.turn == self.color))
                 self.board.pop()
-
-                # 5. Choose the best move.
                 if best_move is None:
                     best_move = move
                     best_eval = eval_value
+                    best_index = idx
                 else:
                     if self.color == chess.WHITE:
                         if eval_value > best_eval:
                             best_eval = eval_value
                             best_move = move
+                            best_index = idx
                     else:
                         if eval_value < best_eval:
                             best_eval = eval_value
                             best_move = move
+                            best_index = idx
 
-            # Log the chosen move (with a dummy log_prob since no gradient is involved).
-            dummy_log_prob = torch.tensor(0.0, device=self.board_tensor.device)
+            m = torch.distributions.Categorical(probs)
+            # Here, get the log probability corresponding to best_index.
+            log_prob = m.log_prob(torch.tensor(best_index, device=device))
             points = self.compute_material_score()
             self.move_history.append({
                 'state_tensor': self.board_tensor,
                 'probs': probs,
-                'action_index': None,
+                'action_index': best_index,
                 'move': best_move,
-                'log_prob': dummy_log_prob,
+                'log_prob': log_prob,
                 'points': points,
-                'lookahead': True  # Mark that this move was chosen via lookahead.
+                'lookahead': True
             })
             return best_move
 
-        # --- Default behavior if not using lookahead ---
+        # --- Default behavior if not using lookahead --- EPSILON GREEDY
         if np.random.rand() < self.epsilon:
             legal_moves = list(self.board.legal_moves)
             move = random.choice(legal_moves)
@@ -354,8 +357,8 @@ class ChessPolicyNet(nn.Module, ChessRL):
                 'random': True
             })
             return move
-        else:
-            probs = self.forward()  # Expected shape: (1, num_actions)
+        else: # --- Default behavior if not using lookahead --- NON GREEDY
+            probs = self.forward()
             m = D.Categorical(probs)
             action = m.sample()
             action_index = action.item()
