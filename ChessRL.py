@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as D
+from torch.nn.utils.rnn import pad_sequence
 from MCTS import mcts
 
 def create_action_space():
@@ -392,81 +393,60 @@ class ChessPolicyNet(nn.Module, ChessRL):
         points = self.compute_material_score()
         self._save_move(move, action_index, log_prob, points, random=False)
         return move
-    
+
     def _save_move(self, move, action_index, log_prob, points, lookahead=False, random=False):
-        """Stores move data in tensor format for efficient training."""
+        """Stores move data efficiently using tensors."""
+        reward_tensor = torch.tensor([points], dtype=torch.float32, device=self.device).detach()
+
+        # Append move data as a single tensor batch
         if not hasattr(self, "move_history_tensors"):
             self.move_history_tensors = {
-                "log_probs": [],
-                "rewards": [],
-                "action_indices": [],
-                "lookahead": [],
-                "random": []
+                "log_probs": torch.empty(0, dtype=torch.float32, device=self.device),
+                "rewards": torch.empty(0, dtype=torch.float32, device=self.device),
+                "action_indices": torch.empty(0, dtype=torch.long, device=self.device),
             }
 
-        self.move_history_tensors["log_probs"].append(log_prob)
-        self.move_history_tensors["rewards"].append(torch.tensor(points, dtype=torch.float32, device=self.device).clone().detach())
-        self.move_history_tensors["action_indices"].append(torch.tensor(action_index if action_index is not None else -1, dtype=torch.long, device=self.device))
-        self.move_history_tensors["lookahead"].append(lookahead)
-        self.move_history_tensors["random"].append(random)
+        self.move_history_tensors["log_probs"] = torch.cat([self.move_history_tensors["log_probs"], log_prob.view(1)])
+        self.move_history_tensors["rewards"] = torch.cat([self.move_history_tensors["rewards"], reward_tensor])
+        self.move_history_tensors["action_indices"] = torch.cat([self.move_history_tensors["action_indices"], torch.tensor([action_index], dtype=torch.long, device=self.device)])
 
     def clear_move_history(self):
         """Resets stored move history tensors for efficient training."""
         self.move_history_tensors = {
-            "log_probs": [],
-            "rewards": [],
-            "action_indices": [],
-            "lookahead": [],
-            "random": []
+            "log_probs": torch.empty(0, dtype=torch.float32, device=self.device),
+            "rewards": torch.empty(0, dtype=torch.float32, device=self.device),
+            "action_indices": torch.empty(0, dtype=torch.long, device=self.device),
         }
 
-def reinforce_update(policy_net, optimizer, gamma=0.99):
-    """
-    Optimized REINFORCE update using batched tensors instead of dictionaries.
-    """
-    if not hasattr(policy_net, "move_history_tensors") or not policy_net.move_history_tensors["log_probs"]:
-        print("No move history found! Skipping update.")
-        return 0.0  # No update needed
+    def reinforce_update(self, optimizer, gamma=0.99):
+        """
+        Perform a REINFORCE update using batched tensors.
+        """
+        if len(self.move_history_tensors["log_probs"]) == 0:
+            print("No move history found! Skipping update.")
+            return 0.0  
 
-    # Debugging prints to check tensor contents
-    print(f"Number of moves stored: {len(policy_net.move_history_tensors['log_probs'])}")
+        # Retrieve tensors
+        log_probs = self.move_history_tensors["log_probs"]
+        rewards = self.move_history_tensors["rewards"]
 
-    # Convert lists to PyTorch tensors for fast operations
-    try:
-        log_probs = torch.stack(policy_net.move_history_tensors["log_probs"])
-        rewards = torch.stack(policy_net.move_history_tensors["rewards"])
-    except RuntimeError as e:
-        print(f"Error stacking tensors: {e}")
-        return 0.0
+        # Compute discounted returns in a vectorized way
+        discounts = torch.tensor([gamma**i for i in range(len(rewards))], device=self.device)
+        returns = torch.flip(torch.cumsum(torch.flip(rewards * discounts, [0]), 0), [0])
 
-    # Check if rewards contain only zeros
-    if rewards.sum().item() == 0:
-        print("All rewards are zero, nothing to optimize.")
-        return 0.0
-
-    # Compute discounted returns
-    returns = torch.zeros_like(rewards)
-    R = 0
-    for t in reversed(range(len(rewards))):
-        R = rewards[t] + gamma * R
-        returns[t] = R
-
-    # Normalize returns
-    if returns.std().item() > 0:
+        # Normalize returns
         returns = (returns - returns.mean()) / (returns.std() + 1e-9)
-    else:
-        print("Returns standard deviation is zero, skipping normalization.")
 
-    # Compute batch loss in one step
-    loss = (-log_probs * returns).mean()
+        # Compute batch loss
+        loss = (-log_probs * returns).mean()
 
-    # Backpropagation
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+        # Backpropagation
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-    # Clear move history
-    policy_net.move_history_tensors = {key: [] for key in policy_net.move_history_tensors}
+        # Clear move history
+        self.clear_move_history()
 
-    print(f"REINFORCE loss: {loss.item():.4f}")
-    return loss.item()
+        print(f"REINFORCE loss: {loss.item():.4f}")
+        return loss.item()

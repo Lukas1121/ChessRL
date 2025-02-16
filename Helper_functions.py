@@ -2,7 +2,7 @@
 
 import os
 import chess
-from ChessRL import ChessRL, ChessPolicyNet, reinforce_update
+from ChessRL import ChessPolicyNet
 import torch
 import random
 import os
@@ -16,81 +16,76 @@ else:
     print("GPU not available, using CPU instead.")
 import matplotlib.pyplot as plt
 
-def play_self_game(policy_net_white, policy_net_black, terminal_reward=100, terminal_loss=100,
-                   per_move_penalty=0, move_length_threshold=200, exceeding_length_penalty=100,
-                   method='rl', minmax_depth=2, top_n=3, simulations=100):
+def play_self_game(policy_net_white, policy_net_black, 
+                   terminal_reward=100, terminal_loss=100, 
+                   per_move_penalty=0, move_length_threshold=200, 
+                   exceeding_length_penalty=100, **kwargs):
     """
-    Play a self-play game between two policy networks, forcefully ending the game
-    if it exceeds move_length_threshold, and adjust terminal rewards accordingly.
-    
-    Returns:
-        tuple: (game_length, result)
+    Plays a self-play game and stores move history tensors inside the networks.
+    Applies terminal rewards correctly at the end.
     """
     board = chess.Board()
-    
+
     while not board.is_game_over():
         if len(policy_net_white.move_history_tensors["log_probs"]) >= move_length_threshold:
-            break
+            break  # Stop if move limit reached
 
         if board.turn == chess.WHITE:
             policy_net_white.update_board(board)
-            move = policy_net_white.choose_move(method=method, minmax_depth=minmax_depth, top_n=top_n, simulations=simulations)
+            move = policy_net_white.choose_move(**kwargs)
             if move not in board.legal_moves:
                 continue
-
+            
             is_capture = board.is_capture(move)
             board.push(move)
             policy_net_white.update_board(board)
 
-            if not is_capture and policy_net_white.move_history_tensors["rewards"]:
-                policy_net_white.move_history_tensors["rewards"][-1] += torch.tensor(
-                    policy_net_white.non_capture_penalty, dtype=torch.float32, device=device
-                )
+            # Update reward
+            if not is_capture and policy_net_white.move_history_tensors["rewards"].numel() > 0:
+                policy_net_white.move_history_tensors["rewards"][-1] += policy_net_white.non_capture_penalty
 
         else:
             policy_net_black.update_board(board)
-            move = policy_net_black.choose_move(method=method, minmax_depth=minmax_depth, top_n=3, simulations=simulations)
+            move = policy_net_black.choose_move(**kwargs)
             if move not in board.legal_moves:
                 continue
-
+            
             is_capture = board.is_capture(move)
             board.push(move)
             policy_net_black.update_board(board)
 
-            if not is_capture and policy_net_black.move_history_tensors["rewards"]:
-                policy_net_black.move_history_tensors["rewards"][-1] += torch.tensor(
-                    policy_net_black.non_capture_penalty, dtype=torch.float32, device=device
-                )
+            # Update reward
+            if not is_capture and policy_net_black.move_history_tensors["rewards"].numel() > 0:
+                policy_net_black.move_history_tensors["rewards"][-1] += policy_net_black.non_capture_penalty
 
+    # --- Apply Terminal Rewards ---
     result = board.result()
-    
     game_length = len(policy_net_white.move_history_tensors["log_probs"])
     length_penalty = per_move_penalty * game_length
 
-    if result == "1-0":
+    if result == "1-0":  # White wins
         terminal_reward_white = terminal_reward
         terminal_reward_black = -terminal_loss
-    elif result == "0-1":
+    elif result == "0-1":  # Black wins
         terminal_reward_white = -terminal_loss
         terminal_reward_black = terminal_reward
-    else:
+    else:  # Draw
         terminal_reward_white = -length_penalty
         terminal_reward_black = -length_penalty
 
+    # Apply exceeding length penalty
     if game_length >= move_length_threshold:
         terminal_reward_white -= exceeding_length_penalty
         terminal_reward_black -= exceeding_length_penalty
 
-    if policy_net_white.move_history_tensors["rewards"]:
-        policy_net_white.move_history_tensors["rewards"][-1] += torch.tensor(
-            terminal_reward_white, dtype=torch.float32, device=device
-        )
-    if policy_net_black.move_history_tensors["rewards"]:
-        policy_net_black.move_history_tensors["rewards"][-1] += torch.tensor(
-            terminal_reward_black, dtype=torch.float32, device=device
-        )
+    if policy_net_white.move_history_tensors["rewards"].numel() > 0:
+        policy_net_white.move_history_tensors["rewards"][-1] += torch.tensor(terminal_reward_white, dtype=torch.float32, device=policy_net_white.device)
+
+    if policy_net_black.move_history_tensors["rewards"].numel() > 0:
+        policy_net_black.move_history_tensors["rewards"][-1] += torch.tensor(terminal_reward_black, dtype=torch.float32, device=policy_net_black.device)
 
     return game_length, result
+
 
 def train_chess_policy_networks(
     num_iterations=400,
@@ -101,7 +96,7 @@ def train_chess_policy_networks(
     gamma=0.95,
     terminal_reward=1000,
     terminal_loss=100,
-    per_move_penalty=1,
+    per_move_penalty =0.5,
     non_capture_penalty=-1,
     move_length_threshold=200,
     exceeding_length_penalty=1000,
@@ -168,11 +163,11 @@ def train_chess_policy_networks(
         results = []
 
         for _ in range(games_per_iteration):
-            play_self_game(
+            game_length, result = play_self_game(
                 policy_net_white, policy_net_black,
-                per_move_penalty=per_move_penalty,
                 terminal_reward=terminal_reward,
                 terminal_loss=terminal_loss,
+                per_move_penalty=per_move_penalty,
                 move_length_threshold=move_length_threshold,
                 exceeding_length_penalty=exceeding_length_penalty,
                 method=method,
@@ -180,18 +175,24 @@ def train_chess_policy_networks(
                 minmax_depth=minmax_depth,
                 top_n=top_n
             )
-            game_lengths.append(len(policy_net_white.move_history_tensors["log_probs"]))
-            results.append(policy_net_white.board.result())
 
-        # Perform REINFORCE updates using vectorized storage
-        white_loss = reinforce_update(policy_net_white, optimizer_white, gamma=gamma)
-        black_loss = reinforce_update(policy_net_black, optimizer_black, gamma=gamma)
+            game_lengths.append(game_length)
+            results.append(result)
+
+        # Perform REINFORCE updates using stored history inside policy networks
+        white_loss = policy_net_white.reinforce_update(optimizer_white, gamma=gamma)
+        black_loss = policy_net_black.reinforce_update(optimizer_black, gamma=gamma)
+
         metrics["white_loss_list"].append(white_loss)
         metrics["black_loss_list"].append(black_loss)
 
         # Compute average rewards
-        white_avg_points = torch.mean(torch.tensor(policy_net_white.move_history_tensors["rewards"], dtype=torch.float32)).item()
-        black_avg_points = torch.mean(torch.tensor(policy_net_black.move_history_tensors["rewards"], dtype=torch.float32)).item()
+        white_rewards = policy_net_white.move_history_tensors["rewards"]
+        black_rewards = policy_net_black.move_history_tensors["rewards"]
+
+        white_avg_points = torch.mean(torch.stack(white_rewards)).item() if white_rewards.numel() > 0 else 0.0
+        black_avg_points = torch.mean(torch.stack(black_rewards)).item() if black_rewards.numel() > 0 else 0.0
+
         metrics["white_avg_points"].append(white_avg_points)
         metrics["black_avg_points"].append(black_avg_points)
 
@@ -210,9 +211,10 @@ def train_chess_policy_networks(
         print(f"Iteration {iteration+1} completed: Avg Length {avg_game_length:.2f}, White Win Rate {white_wins/total_games:.2f}, Black Win Rate {black_wins/total_games:.2f}")
 
     # Save models
-    save_models(policy_net_white=policy_net_white,policy_net_black=policy_net_black)
+    save_models(policy_net_white=policy_net_white, policy_net_black=policy_net_black)
 
     return metrics
+
 
 def get_next_run_directory(base_dir="."):
     """Find the next available run directory (run1, run2, ...)."""
