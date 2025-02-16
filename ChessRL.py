@@ -12,8 +12,7 @@ else:
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as D
-from minmax import get_best_move
-
+from MCTS import mcts
 
 def create_action_space():
     """
@@ -131,14 +130,14 @@ class ChessRL:
         [-10, -20, -20, -20, -20, -20, -20, -10],
         [ 20,  20,   0,   0,   0,   0,  20,  20],
         [ 20,  30,  10,   0,   0,  10,  30,  20]
-    ], dtype=torch.float) / 10
+    ], dtype=torch.float) / 100
     PIECE_VALUES = {
         chess.PAWN: 1,
         chess.KNIGHT: 3,
         chess.BISHOP: 3,
         chess.ROOK: 5,
         chess.QUEEN: 9,
-        chess.KING: 20,
+        chess.KING: 100,
     }
     action_space = create_action_space()
 
@@ -325,114 +324,92 @@ class ChessPolicyNet(nn.Module, ChessRL):
                     break  # Alpha cutoff
             return min_eval
 
-
-    def choose_move(self, use_lookahead=True, minmax_depth=2, top_n=3):
+    def choose_move(self, method="rl", minmax_depth=2, top_n=3, simulations=100):
         """
-        Choose a move using either the RL network directly or a hybrid lookahead that
-        evaluates the top N moves with a minimax search.
-
+        Selects a move using one of three methods:
+        - "lookahead": Uses RL with Minimax for deeper search.
+        - "mcts": Uses Monte Carlo Tree Search.
+        - "rl": Uses the RL network with epsilon-greedy.
+        
         Args:
-            use_lookahead (bool): If True, perform lookahead on top candidate moves.
-            minimax_depth (int): The depth of the lookahead (minimax search).
-            top_n (int): Number of top moves (based on network probabilities) to consider.
+            method (str): "lookahead", "mcts", or "rl".
+            minmax_depth (int): Depth of the Minimax search (if using lookahead).
+            top_n (int): Number of candidate moves to evaluate (for Minimax).
+            simulations (int): Number of simulations for MCTS.
 
         Returns:
             chess.Move: The selected move.
         """
-        if use_lookahead:
-            # Run a forward pass to get probabilities.
-            probs = self.forward()  # Shape: (1, num_actions)
-            probs_np = probs.cpu().detach().numpy().flatten()
-            top_indices = probs_np.argsort()[-top_n:][::-1]  # Sorted descending
+        if method == "lookahead":
+            return self._choose_with_lookahead(minmax_depth, top_n)
+        elif method == "mcts":
+            return mcts(self.board, simulations)
+        else:  # Default: RL with epsilon-greedy
+            return self._choose_with_rl()
 
-            # Filter for legal moves.
-            candidate_moves = []
-            candidate_indices = []
-            for idx in top_indices:
-                move = self.action_space[idx]
-                if move in self.board.legal_moves:
-                    candidate_moves.append(move)
-                    candidate_indices.append(idx)
-            if not candidate_moves:
-                candidate_moves = list(self.board.legal_moves)
-                # If using all legal moves, get their indices:
-                candidate_indices = [self.action_space.index(move) for move in candidate_moves]
+    def _choose_with_lookahead(self, minmax_depth, top_n):
+        """Selects a move using RL-based move probabilities combined with Minimax lookahead."""
+        probs = self.forward()  # Get action probabilities
+        probs_np = probs.cpu().detach().numpy().flatten()
+        top_indices = probs_np.argsort()[-top_n:][::-1]  # Select top N moves
 
-            best_move = None
-            best_eval = None
-            best_index = None
+        candidate_moves = []
+        candidate_indices = []
+        for idx in top_indices:
+            move = self.action_space[idx]
+            if move in self.board.legal_moves:
+                candidate_moves.append(move)
+                candidate_indices.append(idx)
+        if not candidate_moves:
+            candidate_moves = list(self.board.legal_moves)
+            candidate_indices = [self.action_space.index(move) for move in candidate_moves]
 
-            # Evaluate each candidate with minimax.
-            for idx, move in zip(candidate_indices, candidate_moves):
-                self.board.push(move)
-                eval_value = self._minimax(self.board, minmax_depth, -float('inf'), float('inf'), maximizing=(self.board.turn == self.color))
-                self.board.pop()
-                if best_move is None:
-                    best_move = move
-                    best_eval = eval_value
-                    best_index = idx
-                else:
-                    if self.color == chess.WHITE:
-                        if eval_value > best_eval:
-                            best_eval = eval_value
-                            best_move = move
-                            best_index = idx
-                    else:
-                        if eval_value < best_eval:
-                            best_eval = eval_value
-                            best_move = move
-                            best_index = idx
+        best_move, best_eval, best_index = None, None, None
+        for idx, move in zip(candidate_indices, candidate_moves):
+            self.board.push(move)
+            eval_value = self._minimax(self.board, minmax_depth, -float('inf'), float('inf'), maximizing=(self.board.turn == self.color))
+            self.board.pop()
+            if best_move is None or (self.color == chess.WHITE and eval_value > best_eval) or (self.color == chess.BLACK and eval_value < best_eval):
+                best_move, best_eval, best_index = move, eval_value, idx
 
-            m = torch.distributions.Categorical(probs)
-            # Here, get the log probability corresponding to best_index.
-            log_prob = m.log_prob(torch.tensor(best_index, device=device))
-            points = self.compute_material_score()
-            self.move_history.append({
-                'state_tensor': self.board_tensor,
-                'probs': probs,
-                'action_index': best_index,
-                'move': best_move,
-                'log_prob': log_prob,
-                'points': points,
-                'lookahead': True
-            })
-            return best_move
-
-        # --- Default behavior if not using lookahead --- EPSILON GREEDY
+        log_prob = torch.distributions.Categorical(probs).log_prob(torch.tensor(best_index, device=device))
+        points = self.compute_material_score()
+        self._save_move(best_move, best_index, log_prob, points, lookahead=True)
+        return best_move
+    
+    def _choose_with_rl(self):
+        """Selects a move using epsilon-greedy RL policy."""
         if np.random.rand() < self.epsilon:
             legal_moves = list(self.board.legal_moves)
             move = random.choice(legal_moves)
             dummy_log_prob = torch.tensor(0.0, device=self.board_tensor.device)
             points = self.compute_material_score()
-            self.move_history.append({
-                'state_tensor': self.board_tensor,
-                'probs': None,
-                'action_index': None,
-                'move': move,
-                'log_prob': dummy_log_prob,
-                'points': points,
-                'random': True
-            })
+            self._save_move(move, None, dummy_log_prob, points, random=True)
             return move
-        else: # --- Default behavior if not using lookahead --- NON GREEDY
-            probs = self.forward()
-            m = D.Categorical(probs)
-            action = m.sample()
-            action_index = action.item()
-            move = self.action_space[action_index]
 
-            log_prob = m.log_prob(action).to(self.board_tensor.device)
-            points = self.compute_material_score()
-            self.move_history.append({
-                'state_tensor': self.board_tensor,
-                'probs': probs,
-                'action_index': action_index,
-                'move': move,
-                'log_prob': log_prob,
-                'points': points,
-                'random': False
-            })
-            return move
+        probs = self.forward()
+        m = D.Categorical(probs)
+        action = m.sample()
+        action_index = action.item()
+        move = self.action_space[action_index]
+
+        log_prob = m.log_prob(action).to(self.board_tensor.device)
+        points = self.compute_material_score()
+        self._save_move(move, action_index, log_prob, points, random=False)
+        return move
+    
+    def _save_move(self, move, action_index, log_prob, points, lookahead=False, random=False):
+        """Helper function to save move history for learning updates."""
+        self.move_history.append({
+            'state_tensor': self.board_tensor,
+            'probs': None if random else self.forward(),
+            'action_index': action_index,
+            'move': move,
+            'log_prob': log_prob,
+            'points': points,
+            'lookahead': lookahead,
+            'random': random
+        })
 
 def reinforce_update(policy_net, optimizer, gamma=0.99):
     """

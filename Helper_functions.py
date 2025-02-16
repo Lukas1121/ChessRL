@@ -474,7 +474,7 @@ def play_human_vs_bot(white_model_path, black_model_path, human_color=None,
             policy_net.update_board(board)
             if use_lookahead:
                 # Use the minimax branch in choose_move.
-                move = policy_net.choose_move(use_lookahead=use_lookahead, minimax_depth=minimax_depth,top_n=top_n)
+                move = policy_net.choose_move(use_lookahead=use_lookahead, minmax_depth=minimax_depth,top_n=top_n)
             else:
                 # Use the default RL-based move selection.
                 move = policy_net.choose_move()

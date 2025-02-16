@@ -7,5 +7,5 @@
 !run.py
 !ChessRL.ipynb
 !__init__.py
-!minmax.py
+!MCTS.py
 !notes.txt
