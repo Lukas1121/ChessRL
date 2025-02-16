@@ -89,6 +89,11 @@ def play_self_game(policy_net_white, policy_net_black, terminal_reward=100, term
 
     return policy_net_white.move_history, policy_net_black.move_history, game_length, result
 
+import os
+import numpy as np
+import torch
+import chess
+
 def train_chess_policy_networks(
     num_iterations=400,
     games_per_iteration=5,
@@ -109,11 +114,9 @@ def train_chess_policy_networks(
     pretrained_model_path_black=None,
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ):
-    """
-    Train chess policy networks using self-play and the REINFORCE algorithm.
-    (Documentation omitted for brevity)
-    """
-    # Instantiate networks using classes from ChessRL.py
+    """Train chess policy networks using self-play and the REINFORCE algorithm."""
+
+    # Initialize models
     policy_net_white = ChessPolicyNet(
         board=chess.Board(),
         color=chess.WHITE,
@@ -128,17 +131,10 @@ def train_chess_policy_networks(
         epsilon=epsilon_initial
     ).to(device)
 
-    if pretrained_model_path_white is not None:
-        white_state_dict = torch.load(pretrained_model_path_white, map_location=device)
-        policy_net_white.load_state_dict(white_state_dict)
-    else:
-        print("No pretrained White model provided. Training from scratch.")
-
-    if pretrained_model_path_black is not None:
-        black_state_dict = torch.load(pretrained_model_path_black, map_location=device)
-        policy_net_black.load_state_dict(black_state_dict)
-    else:
-        print("No pretrained Black model provided. Training from scratch.")
+    if pretrained_model_path_white:
+        policy_net_white.load_state_dict(torch.load(pretrained_model_path_white, map_location=device))
+    if pretrained_model_path_black:
+        policy_net_black.load_state_dict(torch.load(pretrained_model_path_black, map_location=device))
 
     policy_net_white.train()
     policy_net_black.train()
@@ -146,31 +142,33 @@ def train_chess_policy_networks(
     optimizer_white = torch.optim.Adam(policy_net_white.parameters(), lr=lr)
     optimizer_black = torch.optim.Adam(policy_net_black.parameters(), lr=lr)
 
-    white_avg_points = []
-    black_avg_points = []
-    white_loss_list = []
-    black_loss_list = []
-    white_avg_log_probs = []
-    black_avg_log_probs = []
-    game_length_list = []
-    white_win_rates = []
-    black_win_rates = []
-    draw_rates = []
+    metrics = {
+        "white_loss_list": [],
+        "black_loss_list": [],
+        "white_avg_points": [],
+        "black_avg_points": [],
+        "game_length_list": [],
+        "white_win_rates": [],
+        "black_win_rates": [],
+        "draw_rates": []
+    }
 
     for iteration in range(num_iterations):
         epsilon = max(epsilon_final, epsilon_initial - (epsilon_initial - epsilon_final) * (iteration / num_iterations))
         policy_net_white.epsilon = epsilon
         policy_net_black.epsilon = epsilon
 
-        print(f"Starting iteration {iteration+1}/{num_iterations} with epsilon = {epsilon:.4f}")
+        print(f"Iteration {iteration+1}/{num_iterations} with epsilon = {epsilon:.4f}")
 
-        batch_white_move_history = []
-        batch_black_move_history = []
+        # Reset move history tensors
+        policy_net_white.clear_move_history()
+        policy_net_black.clear_move_history()
+
         game_lengths = []
         results = []
 
         for _ in range(games_per_iteration):
-            wm_history, bm_history, game_length, result = play_self_game(
+            play_self_game(
                 policy_net_white, policy_net_black,
                 per_move_penalty=per_move_penalty,
                 terminal_reward=terminal_reward,
@@ -181,95 +179,40 @@ def train_chess_policy_networks(
                 minmax_depth=minmax_depth,
                 top_n=top_n
             )
-            batch_white_move_history.extend(wm_history)
-            batch_black_move_history.extend(bm_history)
-            game_lengths.append(game_length)
-            results.append(result)
+            game_lengths.append(len(policy_net_white.move_history_tensors["log_probs"]))
+            results.append(policy_net_white.board.result())
 
-        policy_net_white.move_history = batch_white_move_history
-        policy_net_black.move_history = batch_black_move_history
-
+        # Perform REINFORCE updates using vectorized storage
         white_loss = reinforce_update(policy_net_white, optimizer_white, gamma=gamma)
         black_loss = reinforce_update(policy_net_black, optimizer_black, gamma=gamma)
-        white_loss_list.append(white_loss)
-        black_loss_list.append(black_loss)
+        metrics["white_loss_list"].append(white_loss)
+        metrics["black_loss_list"].append(black_loss)
 
-        white_avg = np.mean([entry['points'] for entry in batch_white_move_history])
-        black_avg = np.mean([entry['points'] for entry in batch_black_move_history])
-        white_avg_points.append(white_avg)
-        black_avg_points.append(black_avg)
+        # Compute average rewards
+        white_avg_points = torch.mean(torch.tensor(policy_net_white.move_history_tensors["rewards"], dtype=torch.float32)).item()
+        black_avg_points = torch.mean(torch.tensor(policy_net_black.move_history_tensors["rewards"], dtype=torch.float32)).item()
+        metrics["white_avg_points"].append(white_avg_points)
+        metrics["black_avg_points"].append(black_avg_points)
 
-
+        # Compute game statistics
         avg_game_length = np.mean(game_lengths)
-        game_length_list.append(avg_game_length)
+        metrics["game_length_list"].append(avg_game_length)
 
-        white_wins = sum(1 for r in results if r == "1-0")
-        draws = sum(1 for r in results if r == "1/2-1/2")
-        white_losses = sum(1 for r in results if r == "0-1")
+        white_wins = results.count("1-0")
+        draws = results.count("1/2-1/2")
+        black_wins = results.count("0-1")
         total_games = len(results)
-        win_rate_white = white_wins / total_games
-        draw_rate = draws / total_games
-        win_rate_black = white_losses / total_games
-        white_win_rates.append(win_rate_white)
-        black_win_rates.append(win_rate_black)
-        draw_rates.append(draw_rate)
+        metrics["white_win_rates"].append(white_wins / total_games)
+        metrics["black_win_rates"].append(black_wins / total_games)
+        metrics["draw_rates"].append(draws / total_games)
 
-        print(f"Iteration {iteration+1} complete.")
-        print(f"  Avg Game Length: {avg_game_length:.2f}")
-        print(f"  White Avg Points: {white_avg:.2f}, Black Avg Points: {black_avg:.2f}")
-        print(f"  White Win Rate: {win_rate_white:.2f}, Black Win Rate: {win_rate_black:.2f}, Draw Rate: {draw_rate:.2f}\n")
+        print(f"Iteration {iteration+1} completed: Avg Length {avg_game_length:.2f}, White Win Rate {white_wins/total_games:.2f}, Black Win Rate {black_wins/total_games:.2f}")
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    run_num = 1
-    while os.path.exists(os.path.join(base_dir, f"run{run_num}")):
-        run_num += 1
-    save_folder = os.path.join(base_dir, f"run{run_num}")
-    os.makedirs(save_folder, exist_ok=True)
-
-    white_save_path = os.path.join(save_folder, "policy_net_white.pth")
-    black_save_path = os.path.join(save_folder, "policy_net_black.pth")
-
-    torch.save(policy_net_white.state_dict(), white_save_path)
-    torch.save(policy_net_black.state_dict(), black_save_path)
-    print("Models saved in folder:", save_folder)
-
-    params = {
-        "num_iterations": num_iterations,
-        "games_per_iteration": games_per_iteration,
-        "epsilon_initial": epsilon_initial,
-        "epsilon_final": epsilon_final,
-        "lr": lr,
-        "gamma": gamma,
-        "terminal_reward": terminal_reward,
-        "terminal_loss": terminal_loss,
-        "per_move_penalty": per_move_penalty,
-        "non_capture_penalty": non_capture_penalty,
-        "move_length_threshold": move_length_threshold,
-        "exceeding_length_penalty": exceeding_length_penalty,
-        "pretrained_model_path_white": pretrained_model_path_white,
-        "pretrained_model_path_black": pretrained_model_path_black,
-    }
-
-    params_file = os.path.join(save_folder, "parameters.txt")
-    with open(params_file, "w") as f:
-        for key, value in params.items():
-            f.write(f"{key}: {value}\n")
-    print("Parameters saved to:", params_file)
-
-    metrics = {
-        "policy_net_white": policy_net_white,
-        "policy_net_black": policy_net_black,
-        "white_loss_list": white_loss_list,
-        "black_loss_list": black_loss_list,
-        "white_avg_points": white_avg_points,
-        "black_avg_points": black_avg_points,
-        "white_avg_log_probs": white_avg_log_probs,
-        "black_avg_log_probs": black_avg_log_probs,
-        "game_length_list": game_length_list,
-        "white_win_rates": white_win_rates,
-        "black_win_rates": black_win_rates,
-        "draw_rates": draw_rates
-    }
+    # Save models
+    save_dir = os.path.join(os.getcwd(), f"run_{num_iterations}_iters")
+    os.makedirs(save_dir, exist_ok=True)
+    torch.save(policy_net_white.state_dict(), os.path.join(save_dir, "policy_net_white.pth"))
+    torch.save(policy_net_black.state_dict(), os.path.join(save_dir, "policy_net_black.pth"))
 
     return metrics
 

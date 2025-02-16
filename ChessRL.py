@@ -399,67 +399,53 @@ class ChessPolicyNet(nn.Module, ChessRL):
         return move
     
     def _save_move(self, move, action_index, log_prob, points, lookahead=False, random=False):
-        """Helper function to save move history for learning updates."""
-        self.move_history.append({
-            'state_tensor': self.board_tensor,
-            'probs': None if random else self.forward(),
-            'action_index': action_index,
-            'move': move,
-            'log_prob': log_prob,
-            'points': points,
-            'lookahead': lookahead,
-            'random': random
-        })
+        """Stores move data in tensor format for efficient training."""
+        if not hasattr(self, "move_history_tensors"):
+            self.move_history_tensors = {
+                "log_probs": [],
+                "rewards": [],
+                "action_indices": [],
+                "lookahead": [],
+                "random": []
+            }
+
+        self.move_history_tensors["log_probs"].append(log_prob)
+        self.move_history_tensors["rewards"].append(torch.tensor(points, dtype=torch.float32, device=self.board_tensor.device))
+        self.move_history_tensors["action_indices"].append(torch.tensor(action_index if action_index is not None else -1, dtype=torch.long, device=device))
+        self.move_history_tensors["lookahead"].append(lookahead)
+        self.move_history_tensors["random"].append(random)
 
 def reinforce_update(policy_net, optimizer, gamma=0.99):
     """
-    Perform a REINFORCE update using the move history stored in policy_net.move_history.
-
-    Each move entry should contain:
-      - 'log_prob': A tensor containing the log probability (requires grad).
-      - 'points': The reward for that move.
-
-    Args:
-        policy_net: The policy network instance (e.g., for White or Black).
-        optimizer: The optimizer to update policy_net parameters.
-        gamma (float): Discount factor.
-
-    Returns:
-        float: The loss value.
+    Optimized REINFORCE update using batched tensors instead of dictionaries.
     """
-    # 1. Extract rewards from the move history.
-    rewards = [entry['points'] for entry in policy_net.move_history]
+    if not hasattr(policy_net, "move_history_tensors") or not policy_net.move_history_tensors["log_probs"]:
+        return 0.0  # No update needed
 
-    # 2. Compute cumulative discounted rewards (returns).
-    returns_list = []
+    # Convert lists to PyTorch tensors for fast operations
+    log_probs = torch.stack(policy_net.move_history_tensors["log_probs"])
+    rewards = torch.stack(policy_net.move_history_tensors["rewards"])
+
+    # Compute discounted returns
+    returns = torch.zeros_like(rewards)
     R = 0
-    for r in reversed(rewards):
-        R = r + gamma * R
-        returns_list.insert(0, R)
+    for t in reversed(range(len(rewards))):
+        R = rewards[t] + gamma * R
+        returns[t] = R
 
-    # Create the returns tensor on the same device as the model.
-    returns = torch.tensor(returns_list, dtype=torch.float32, device=policy_net.board_tensor.device)
-    # Squeeze the returns tensor so that each element is a scalar.
-    returns = returns.squeeze()
-
-    # Optionally normalize returns.
+    # Normalize returns
     returns = (returns - returns.mean()) / (returns.std() + 1e-9)
 
-    # 3. Compute the REINFORCE loss.
-    loss = 0
-    for i, entry in enumerate(policy_net.move_history):
-        # Squeeze the log probability so that it is a scalar.
-        log_prob = entry['log_prob'].squeeze()
-        loss += -log_prob * returns[i].squeeze()  # Ensure both are scalars.
+    # Compute batch loss in one step
+    loss = (-log_probs * returns).mean()
 
-    # 4. Backpropagate and update the network.
+    # Backpropagation
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    loss_val = loss.item()
-    print(f"REINFORCE loss: {loss_val:.4f}")
+    # Clear move history
+    policy_net.move_history_tensors = {key: [] for key in policy_net.move_history_tensors}
 
-    # Clear the move history for the next batch.
-    policy_net.move_history = []
-    return loss_val
+    print(f"REINFORCE loss: {loss.item():.4f}")
+    return loss.item()
