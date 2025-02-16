@@ -1,3 +1,7 @@
+import numpy as np
+import random
+import chess
+
 class MCTSNode:
     def __init__(self, board, parent=None, move=None):
         self.board = board.copy()
@@ -12,9 +16,11 @@ class MCTSNode:
         return len(self.untried_moves) == 0
     
     def best_child(self, exploration_weight=1.4):
-        """Selects the best child based on UCT (Upper Confidence Bound for Trees)."""
-        return max(self.children, key=lambda child: (child.value / (child.visits + 1e-6)) +
-                    exploration_weight * math.sqrt(math.log(self.visits + 1) / (child.visits + 1e-6)))
+        """Selects the best child based on UCT (Upper Confidence Bound for Trees) using NumPy."""
+        values = np.array([(child.value / (child.visits + 1e-6)) +
+                          exploration_weight * np.sqrt(np.log(self.visits + 1) / (child.visits + 1e-6))
+                          for child in self.children])
+        return self.children[np.argmax(values)]
 
     def select_child(self):
         """Select the child with the highest UCT value."""

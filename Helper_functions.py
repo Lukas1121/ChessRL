@@ -16,56 +16,55 @@ else:
     print("GPU not available, using CPU instead.")
 import matplotlib.pyplot as plt
 
-# Now you can define your helper functions here
 def play_self_game(policy_net_white, policy_net_black, terminal_reward=100, terminal_loss=100,
                    per_move_penalty=0, move_length_threshold=200, exceeding_length_penalty=100,
-                   use_lookahead=False,minmax_depth=2,top_n=3):
+                   method='rl', minmax_depth=2, top_n=3, simulations=100):
     """
     Play a self-play game between two policy networks, forcefully ending the game
     if it exceeds move_length_threshold, and adjust terminal rewards accordingly.
     
     Returns:
-        tuple: (white_move_history, black_move_history, game_length, result)
+        tuple: (game_length, result)
     """
     board = chess.Board()
     
     while not board.is_game_over():
-        if len(policy_net_white.move_history) >= move_length_threshold:
+        if len(policy_net_white.move_history_tensors["log_probs"]) >= move_length_threshold:
             break
 
         if board.turn == chess.WHITE:
             policy_net_white.update_board(board)
-            move = policy_net_white.choose_move(use_lookahead=use_lookahead,minmax_depth=minmax_depth,top_n=top_n)
+            move = policy_net_white.choose_move(method=method, minmax_depth=minmax_depth, top_n=top_n, simulations=simulations)
             if move not in board.legal_moves:
                 continue
 
-            # Check if the move is a capture
             is_capture = board.is_capture(move)
-
             board.push(move)
             policy_net_white.update_board(board)
 
-            if not is_capture:
-                policy_net_white.move_history[-1]['points'] += policy_net_white.non_capture_penalty
+            if not is_capture and policy_net_white.move_history_tensors["rewards"]:
+                policy_net_white.move_history_tensors["rewards"][-1] += torch.tensor(
+                    policy_net_white.non_capture_penalty, dtype=torch.float32, device=device
+                )
+
         else:
             policy_net_black.update_board(board)
-            move = policy_net_black.choose_move(use_lookahead=use_lookahead,minmax_depth=minmax_depth,top_n=top_n)
+            move = policy_net_black.choose_move(method=method, minmax_depth=minmax_depth, top_n=3, simulations=simulations)
             if move not in board.legal_moves:
                 continue
 
-            # Check if the move is a capture
             is_capture = board.is_capture(move)
-
             board.push(move)
             policy_net_black.update_board(board)
 
-            # Apply penalty if no capture occurred
-            if not is_capture:
-                policy_net_black.move_history[-1]['points'] += policy_net_black.non_capture_penalty
+            if not is_capture and policy_net_black.move_history_tensors["rewards"]:
+                policy_net_black.move_history_tensors["rewards"][-1] += torch.tensor(
+                    policy_net_black.non_capture_penalty, dtype=torch.float32, device=device
+                )
 
     result = board.result()
     
-    game_length = len(policy_net_white.move_history)
+    game_length = len(policy_net_white.move_history_tensors["log_probs"])
     length_penalty = per_move_penalty * game_length
 
     if result == "1-0":
@@ -82,17 +81,16 @@ def play_self_game(policy_net_white, policy_net_black, terminal_reward=100, term
         terminal_reward_white -= exceeding_length_penalty
         terminal_reward_black -= exceeding_length_penalty
 
-    if policy_net_white.move_history:
-        policy_net_white.move_history[-1]['points'] = policy_net_white.move_history[-1].get('points', 0) + terminal_reward_white
-    if policy_net_black.move_history:
-        policy_net_black.move_history[-1]['points'] = policy_net_black.move_history[-1].get('points', 0) + terminal_reward_black
+    if policy_net_white.move_history_tensors["rewards"]:
+        policy_net_white.move_history_tensors["rewards"][-1] += torch.tensor(
+            terminal_reward_white, dtype=torch.float32, device=device
+        )
+    if policy_net_black.move_history_tensors["rewards"]:
+        policy_net_black.move_history_tensors["rewards"][-1] += torch.tensor(
+            terminal_reward_black, dtype=torch.float32, device=device
+        )
 
-    return policy_net_white.move_history, policy_net_black.move_history, game_length, result
-
-import os
-import numpy as np
-import torch
-import chess
+    return game_length, result
 
 def train_chess_policy_networks(
     num_iterations=400,
@@ -107,12 +105,12 @@ def train_chess_policy_networks(
     non_capture_penalty=-1,
     move_length_threshold=200,
     exceeding_length_penalty=1000,
-    use_lookahead=False,
+    method='rl',
+    simulations=100,
     minmax_depth=2,
     top_n=3,
     pretrained_model_path_white=None,
     pretrained_model_path_black=None,
-    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ):
     """Train chess policy networks using self-play and the REINFORCE algorithm."""
 
@@ -120,6 +118,7 @@ def train_chess_policy_networks(
     policy_net_white = ChessPolicyNet(
         board=chess.Board(),
         color=chess.WHITE,
+        device=device,
         non_capture_penalty=non_capture_penalty,
         epsilon=epsilon_initial
     ).to(device)
@@ -127,6 +126,7 @@ def train_chess_policy_networks(
     policy_net_black = ChessPolicyNet(
         board=chess.Board(),
         color=chess.BLACK,
+        device=device,
         non_capture_penalty=non_capture_penalty,
         epsilon=epsilon_initial
     ).to(device)
@@ -175,7 +175,8 @@ def train_chess_policy_networks(
                 terminal_loss=terminal_loss,
                 move_length_threshold=move_length_threshold,
                 exceeding_length_penalty=exceeding_length_penalty,
-                use_lookahead=use_lookahead,
+                method=method,
+                simulations=simulations,
                 minmax_depth=minmax_depth,
                 top_n=top_n
             )
@@ -209,13 +210,25 @@ def train_chess_policy_networks(
         print(f"Iteration {iteration+1} completed: Avg Length {avg_game_length:.2f}, White Win Rate {white_wins/total_games:.2f}, Black Win Rate {black_wins/total_games:.2f}")
 
     # Save models
-    save_dir = os.path.join(os.getcwd(), f"run_{num_iterations}_iters")
-    os.makedirs(save_dir, exist_ok=True)
-    torch.save(policy_net_white.state_dict(), os.path.join(save_dir, "policy_net_white.pth"))
-    torch.save(policy_net_black.state_dict(), os.path.join(save_dir, "policy_net_black.pth"))
+    save_models(policy_net_white=policy_net_white,policy_net_black=policy_net_black)
 
     return metrics
 
+def get_next_run_directory(base_dir="."):
+    """Find the next available run directory (run1, run2, ...)."""
+    run_number = 1
+    while os.path.exists(os.path.join(base_dir, f"run{run_number}")):
+        run_number += 1
+    return os.path.join(base_dir, f"run{run_number}")
+
+
+def save_models(policy_net_white, policy_net_black, base_dir="."):
+    """Save models in an incrementing run directory."""
+    save_dir = get_next_run_directory(base_dir)
+    os.makedirs(save_dir, exist_ok=True)
+    torch.save(policy_net_white.state_dict(), os.path.join(save_dir, "policy_net_white.pth"))
+    torch.save(policy_net_black.state_dict(), os.path.join(save_dir, "policy_net_black.pth"))
+    print(f"Models saved in {save_dir}")
 
 def bin_data(data, num_bins):
     """
@@ -353,7 +366,7 @@ def print_custom_board(board):
 
 
 def play_human_vs_bot(white_model_path, black_model_path, human_color=None,
-                      use_lookahead=False, minimax_depth=1,top_n=3):
+                      method='rl', minmax_depth=1, top_n=3, simulations=100):
     """
     Play a game of chess between a human and the bot.
     
@@ -362,10 +375,11 @@ def play_human_vs_bot(white_model_path, black_model_path, human_color=None,
         black_model_path (str): Path to the pretrained model file for Black.
         human_color (chess.WHITE or chess.BLACK or None): The color you wish to play.
             If set to None, the bot's color is chosen at random, and you play the opposite.
-        device (torch.device): The device on which to load the model.
-        use_minimax (bool): If True, the bot will use minimax search to select its moves.
-        minimax_depth (int): The depth to search when using minimax.
-        
+        method (str): The method for move selection ('rl', 'mcts', 'lookahead').
+        minmax_depth (int): The depth to search when using minimax.
+        top_n (int): Number of candidate moves to evaluate in minimax.
+        simulations (int): Number of simulations for MCTS.
+    
     Behavior:
         - If human_color is provided, the bot plays the opposite color.
         - If human_color is None, a random color is chosen for the bot.
@@ -394,12 +408,14 @@ def play_human_vs_bot(white_model_path, black_model_path, human_color=None,
     if bot_color == chess.WHITE:
         policy_net = ChessPolicyNet(
             board=board,
+            device=device,
             color=chess.WHITE
         ).to(device)
         policy_net.load_state_dict(torch.load(white_model_path, map_location=device))
     else:
         policy_net = ChessPolicyNet(
             board=board,
+            device=device,
             color=chess.BLACK
         ).to(device)
         policy_net.load_state_dict(torch.load(black_model_path, map_location=device))
@@ -415,12 +431,7 @@ def play_human_vs_bot(white_model_path, black_model_path, human_color=None,
         if board.turn == bot_color:
             # Bot's turn.
             policy_net.update_board(board)
-            if use_lookahead:
-                # Use the minimax branch in choose_move.
-                move = policy_net.choose_move(use_lookahead=use_lookahead, minmax_depth=minimax_depth,top_n=top_n)
-            else:
-                # Use the default RL-based move selection.
-                move = policy_net.choose_move()
+            move = policy_net.choose_move(method=method, minmax_depth=minmax_depth, top_n=top_n, simulations=simulations)
             
             if move not in board.legal_moves:
                 print("Selected move is illegal! (Something is wrong with masking.)")

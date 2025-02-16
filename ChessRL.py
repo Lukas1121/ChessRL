@@ -3,12 +3,6 @@ import random
 import chess
 import numpy as np
 import torch
-if torch.cuda.is_available():
-    device = torch.device("cuda")  # Use the first available GPU
-    print("GPU is available and being used.")
-else:
-    device = torch.device("cpu")
-    print("GPU not available, using CPU instead.")
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as D
@@ -249,10 +243,11 @@ class ChessRL:
         self.last_material_score = current_score
 
 class ChessPolicyNet(nn.Module, ChessRL):
-    def __init__(self, board, color, non_capture_penalty=-0.2, epsilon=0.1):
+    def __init__(self, board, color, device, non_capture_penalty=-0.2, epsilon=0.1):
         nn.Module.__init__(self)
         ChessRL.__init__(self, board, color)
         # Define convolutional layers:
+        self.device = device
         self.conv1 = nn.Conv2d(in_channels=12, out_channels=32, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
 
@@ -270,14 +265,14 @@ class ChessPolicyNet(nn.Module, ChessRL):
     def forward(self):
         # Use the stored board tensor; assume it’s already updated.
         # Add batch dimension if necessary.
-        x = self.board_tensor.to(device).unsqueeze(0)  # Now x has shape (1, 12, 8, 8)
+        x = self.board_tensor.to(self.device).unsqueeze(0)  # Now x has shape (1, 12, 8, 8)
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = x.view(x.size(0), -1)
         x = F.relu(self.fc1(x))
         logits = self.fc2(x)
         # Generate legal mask and apply it.
-        legal_mask = self.create_legal_mask().to(device)  # Shape: (num_actions,)
+        legal_mask = self.create_legal_mask().to(self.device)  # Shape: (num_actions,)
         legal_mask = legal_mask.unsqueeze(0).expand_as(logits)
         masked_logits = logits + (legal_mask - 1) * 1e8
         probs = F.softmax(masked_logits, dim=-1)
@@ -372,7 +367,7 @@ class ChessPolicyNet(nn.Module, ChessRL):
             if best_move is None or (self.color == chess.WHITE and eval_value > best_eval) or (self.color == chess.BLACK and eval_value < best_eval):
                 best_move, best_eval, best_index = move, eval_value, idx
 
-        log_prob = torch.distributions.Categorical(probs).log_prob(torch.tensor(best_index, device=device))
+        log_prob = torch.distributions.Categorical(probs).log_prob(torch.tensor(best_index, device=self.device))
         points = self.compute_material_score()
         self._save_move(best_move, best_index, log_prob, points, lookahead=True)
         return best_move
@@ -382,7 +377,7 @@ class ChessPolicyNet(nn.Module, ChessRL):
         if np.random.rand() < self.epsilon:
             legal_moves = list(self.board.legal_moves)
             move = random.choice(legal_moves)
-            dummy_log_prob = torch.tensor(0.0, device=self.board_tensor.device)
+            dummy_log_prob = torch.tensor(0.0, device=self.device)
             points = self.compute_material_score()
             self._save_move(move, None, dummy_log_prob, points, random=True)
             return move
@@ -393,7 +388,7 @@ class ChessPolicyNet(nn.Module, ChessRL):
         action_index = action.item()
         move = self.action_space[action_index]
 
-        log_prob = m.log_prob(action).to(self.board_tensor.device)
+        log_prob = m.log_prob(action).to(self.device)
         points = self.compute_material_score()
         self._save_move(move, action_index, log_prob, points, random=False)
         return move
@@ -410,21 +405,44 @@ class ChessPolicyNet(nn.Module, ChessRL):
             }
 
         self.move_history_tensors["log_probs"].append(log_prob)
-        self.move_history_tensors["rewards"].append(torch.tensor(points, dtype=torch.float32, device=self.board_tensor.device))
-        self.move_history_tensors["action_indices"].append(torch.tensor(action_index if action_index is not None else -1, dtype=torch.long, device=device))
+        self.move_history_tensors["rewards"].append(torch.tensor(points, dtype=torch.float32, device=self.device).clone().detach())
+        self.move_history_tensors["action_indices"].append(torch.tensor(action_index if action_index is not None else -1, dtype=torch.long, device=self.device))
         self.move_history_tensors["lookahead"].append(lookahead)
         self.move_history_tensors["random"].append(random)
+
+    def clear_move_history(self):
+        """Resets stored move history tensors for efficient training."""
+        self.move_history_tensors = {
+            "log_probs": [],
+            "rewards": [],
+            "action_indices": [],
+            "lookahead": [],
+            "random": []
+        }
 
 def reinforce_update(policy_net, optimizer, gamma=0.99):
     """
     Optimized REINFORCE update using batched tensors instead of dictionaries.
     """
     if not hasattr(policy_net, "move_history_tensors") or not policy_net.move_history_tensors["log_probs"]:
+        print("No move history found! Skipping update.")
         return 0.0  # No update needed
 
+    # Debugging prints to check tensor contents
+    print(f"Number of moves stored: {len(policy_net.move_history_tensors['log_probs'])}")
+
     # Convert lists to PyTorch tensors for fast operations
-    log_probs = torch.stack(policy_net.move_history_tensors["log_probs"])
-    rewards = torch.stack(policy_net.move_history_tensors["rewards"])
+    try:
+        log_probs = torch.stack(policy_net.move_history_tensors["log_probs"])
+        rewards = torch.stack(policy_net.move_history_tensors["rewards"])
+    except RuntimeError as e:
+        print(f"Error stacking tensors: {e}")
+        return 0.0
+
+    # Check if rewards contain only zeros
+    if rewards.sum().item() == 0:
+        print("All rewards are zero, nothing to optimize.")
+        return 0.0
 
     # Compute discounted returns
     returns = torch.zeros_like(rewards)
@@ -434,7 +452,10 @@ def reinforce_update(policy_net, optimizer, gamma=0.99):
         returns[t] = R
 
     # Normalize returns
-    returns = (returns - returns.mean()) / (returns.std() + 1e-9)
+    if returns.std().item() > 0:
+        returns = (returns - returns.mean()) / (returns.std() + 1e-9)
+    else:
+        print("Returns standard deviation is zero, skipping normalization.")
 
     # Compute batch loss in one step
     loss = (-log_probs * returns).mean()
