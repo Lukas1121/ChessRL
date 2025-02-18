@@ -134,6 +134,10 @@ class ChessRL:
     action_space = create_action_space()
     move_to_idx = {move.uci(): idx for idx, move in enumerate(action_space)}
 
+    # Precompute a mapping from square to (row, col)
+    SQUARE_TO_RC = {square: (7 - chess.square_rank(square), chess.square_file(square))
+                    for square in chess.SQUARES}
+
     def __init__(self, board, color):
         self.board = board
         self.board_tensor = self.board_to_tensor(board)
@@ -142,17 +146,12 @@ class ChessRL:
 
     def board_to_tensor(self, board):
         tensor = torch.zeros(12, 8, 8, dtype=torch.float)
-        for square in chess.SQUARES:
-            piece = board.piece_at(square)
-            if piece is not None:
-                if piece.color == chess.WHITE:
-                    channel = piece.piece_type - 1
-                else:
-                    channel = piece.piece_type - 1 + 6
-                row = 7 - chess.square_rank(square)
-                col = chess.square_file(square)
-                tensor[channel, row, col] = 1
+        for square, piece in board.piece_map().items():
+            row, col = self.SQUARE_TO_RC[square]
+            channel = piece.piece_type - 1 + (0 if piece.color == chess.WHITE else 6)
+            tensor[channel, row, col] = 1
         return tensor
+
     
     def precompute_value_tensor(self):
         # Create a tensor of shape [12, 8, 8] for piece values (material + positional)
@@ -200,34 +199,6 @@ class ChessRL:
         total_score = torch.sum(self.board_tensor * self.value_tensor)
         # Return the score from the perspective of the agent's color.
         return total_score if self.color == chess.WHITE else -total_score       
-
-    # def compute_material_score(self, board=None):
-    #     if board is None:
-    #         board = self.board
-
-    #     total_value = 0.0
-    #     for square in chess.SQUARES:
-    #         piece = board.piece_at(square)
-    #         if piece is None:
-    #             continue
-
-    #         material_value = self.PIECE_VALUES.get(piece.piece_type, 0)
-    #         row = chess.square_rank(square)
-    #         col = chess.square_file(square)
-
-    #         if piece.color == chess.WHITE:
-    #             pos_value = self.get_positional_value(piece.piece_type, row, col)
-    #             total_value += (material_value + pos_value)
-    #         else:
-    #             flipped_row = 7 - row
-    #             pos_value = self.get_positional_value(piece.piece_type, flipped_row, col)
-    #             total_value -= (material_value + pos_value)
-
-    #     # Print debug info to check if the score is symmetric
-    #     score_for_white = total_value
-    #     score_for_black = -total_value
-
-    #     return score_for_white if self.color == chess.WHITE else score_for_black
 
     def get_positional_value(self, piece_type, row, col):
         if piece_type == chess.PAWN:
