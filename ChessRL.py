@@ -151,7 +151,6 @@ class ChessRL:
             channel = piece.piece_type - 1 + (0 if piece.color == chess.WHITE else 6)
             tensor[channel, row, col] = 1
         return tensor
-
     
     def precompute_value_tensor(self):
         # Create a tensor of shape [12, 8, 8] for piece values (material + positional)
@@ -224,6 +223,29 @@ class ChessRL:
         self.material_delta = current_score - self.last_material_score
         # Update the last_material_score for the next comparison.
         self.last_material_score = current_score
+
+    def _save_move(self, move, action_index, log_prob, points):
+        """Stores move data efficiently using tensors."""
+        reward_tensor = torch.tensor([points], dtype=torch.float32, device=self.device).detach()
+
+        # Append move data as a single tensor batch
+        if not hasattr(self, "move_history_tensors"):
+            self.move_history_tensors = {
+                "log_probs": torch.empty(0, dtype=torch.float32, device=self.device),
+                "rewards": torch.empty(0, dtype=torch.float32, device=self.device),
+                "action_indices": torch.empty(0, dtype=torch.long, device=self.device),
+            }
+
+        self.move_history_tensors["log_probs"] = torch.cat([self.move_history_tensors["log_probs"], log_prob.view(1)])
+        self.move_history_tensors["rewards"] = torch.cat([self.move_history_tensors["rewards"], reward_tensor])
+        self.move_history_tensors["action_indices"] = torch.cat([self.move_history_tensors["action_indices"], torch.tensor([action_index], dtype=torch.long, device=self.device)])
+
+    def clear_move_history(self):
+        self.move_history_tensors = {
+            "log_probs": torch.empty(0, dtype=torch.float32, device=self.device),
+            "rewards": torch.empty(0, dtype=torch.float32, device=self.device),
+            "action_indices": torch.empty(0, dtype=torch.long, device=self.device),
+        }
 
 class ChessPolicyNet(nn.Module, ChessRL):
     def __init__(self, board, color, device, non_capture_penalty=-0.2, epsilon=0.1):
@@ -378,29 +400,6 @@ class ChessPolicyNet(nn.Module, ChessRL):
         self._save_move(move, action_index, log_prob, points)
         return move
 
-    def _save_move(self, move, action_index, log_prob, points):
-        """Stores move data efficiently using tensors."""
-        reward_tensor = torch.tensor([points], dtype=torch.float32, device=self.device).detach()
-
-        # Append move data as a single tensor batch
-        if not hasattr(self, "move_history_tensors"):
-            self.move_history_tensors = {
-                "log_probs": torch.empty(0, dtype=torch.float32, device=self.device),
-                "rewards": torch.empty(0, dtype=torch.float32, device=self.device),
-                "action_indices": torch.empty(0, dtype=torch.long, device=self.device),
-            }
-
-        self.move_history_tensors["log_probs"] = torch.cat([self.move_history_tensors["log_probs"], log_prob.view(1)])
-        self.move_history_tensors["rewards"] = torch.cat([self.move_history_tensors["rewards"], reward_tensor])
-        self.move_history_tensors["action_indices"] = torch.cat([self.move_history_tensors["action_indices"], torch.tensor([action_index], dtype=torch.long, device=self.device)])
-
-    def clear_move_history(self):
-        self.move_history_tensors = {
-            "log_probs": torch.empty(0, dtype=torch.float32, device=self.device),
-            "rewards": torch.empty(0, dtype=torch.float32, device=self.device),
-            "action_indices": torch.empty(0, dtype=torch.long, device=self.device),
-        }
-
     def reinforce_update(self, optimizer, game_histories, gamma=0.99):
         """
         Perform a REINFORCE update using a batch of game histories.
@@ -459,3 +458,26 @@ class ChessPolicyNet(nn.Module, ChessRL):
 
         print(f"REINFORCE loss: {total_loss.item():.4f}")
         return total_loss.item()
+
+class ChessHybridNet(nn.Module,ChessRL):
+    def __init__(self, board, color, device):
+        nn.Module.__init__(self)
+        ChessRL.__init__(self, board, color)
+        self.device = device
+        self.conv1 = nn.Conv2d(in_channels=12, out_channels=32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
+        self.fc1 = nn.Linear(64 * 8 * 8, 512)
+        
+        num_actions = len(ChessRL.action_space)
+        self.policy_head = nn.Linear(512, num_actions)
+        self.value_head = nn.Linear(512, 1)
+    
+    def forward(self, board_tensor):
+        x = board_tensor.to(self.device).unsqueeze(0)  # (1, 12, 8, 8)
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        policy_logits = self.policy_head(x)
+        value = torch.tanh(self.value_head(x))  # value in [-1,1]
+        return F.softmax(policy_logits, dim=-1), value

@@ -1,13 +1,13 @@
 import Helper_functions as hf
 
-pretrained_model_path_white = "run5\policy_net_white.pth"
-pretrained_model_path_black = "run5\policy_net_black.pth"
+pretrained_model_path_white = None
+pretrained_model_path_black = None
 
 metrics = hf.train_chess_policy_networks(
-    num_iterations=1000,
-    games_per_iteration=100,
-    epsilon_initial=0.4,
-    epsilon_final=0.01,
+    num_iterations=20,
+    games_per_iteration=1,
+    epsilon_initial=0.5,
+    epsilon_final=0.5,
     lr=0.001,
     gamma=0.98,
     terminal_reward=1000,
@@ -20,5 +20,3 @@ metrics = hf.train_chess_policy_networks(
     pretrained_model_path_white=pretrained_model_path_white,
     pretrained_model_path_black=pretrained_model_path_black,
 )
-
-hf.plot_training_metrics_binned(metrics,num_bins=20)

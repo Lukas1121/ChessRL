@@ -3,74 +3,88 @@ import random
 import chess
 
 class MCTSNode:
-    def __init__(self, board, parent=None, move=None):
+    def __init__(self, board, network, action_space, parent=None, move=None):
         self.board = board.copy()
+        self.network = network
+        self.action_space = action_space  # Pass the action space here
         self.parent = parent
         self.move = move  # The move that led to this node
-        self.children = []
+        self.children = {}  # Map moves to child nodes
         self.visits = 0
-        self.value = 0.0
-        self.untried_moves = list(board.legal_moves)  # Moves yet to be explored
-    
-    def is_fully_expanded(self):
-        return len(self.untried_moves) == 0
-    
-    def best_child(self, exploration_weight=1.4):
-        """Selects the best child based on UCT (Upper Confidence Bound for Trees) using NumPy."""
-        values = np.array([(child.value / (child.visits + 1e-6)) +
-                          exploration_weight * np.sqrt(np.log(self.visits + 1) / (child.visits + 1e-6))
-                          for child in self.children])
-        return self.children[np.argmax(values)]
+        self.value_sum = 0.0
+        self.is_terminal = board.is_game_over()
 
-    def select_child(self):
-        """Select the child with the highest UCT value."""
-        return self.best_child()
-    
+        if not self.is_terminal:
+            board_tensor = network.board_to_tensor(self.board)
+            policy, value = network.forward(board_tensor)
+            legal_moves = list(self.board.legal_moves)
+            self.priors = {}
+            for move in legal_moves:
+                action_index = self.action_space.index(move)
+                self.priors[move] = policy[0, action_index].item()
+        else:
+            self.priors = {}
+
+    def is_fully_expanded(self):
+        """A node is fully expanded if all legal moves have been added as children."""
+        return len(self.children) == len(list(self.board.legal_moves))
+
+    def best_child(self, c_puct=1.4):
+        """Selects the best child using a PUCT formula that incorporates prior probabilities."""
+        best_score = -float('inf')
+        best_child = None
+        for move, child in self.children.items():
+            # Q: average value; U: exploration bonus
+            Q = child.value_sum / (child.visits + 1e-8)
+            U = c_puct * self.priors[move] * np.sqrt(self.visits) / (1 + child.visits)
+            score = Q + U
+            if score > best_score:
+                best_score = score
+                best_child = child
+        return best_child
+
     def expand(self):
-        """Expands a new child from an untried move."""
-        move = self.untried_moves.pop()
+        """Expands one child not already in the tree."""
+        legal_moves = list(self.board.legal_moves)
+        unexpanded_moves = [move for move in legal_moves if move not in self.children]
+        if not unexpanded_moves:
+            return None
+        move = random.choice(unexpanded_moves)
         new_board = self.board.copy()
         new_board.push(move)
-        child_node = MCTSNode(new_board, parent=self, move=move)
-        self.children.append(child_node)
+        child_node = MCTSNode(new_board, self.network, parent=self, move=move)
+        self.children[move] = child_node
         return child_node
-    
-    def rollout(self):
-        """Performs a random rollout from the current state and returns the final result."""
-        rollout_board = self.board.copy()
-        while not rollout_board.is_game_over():
-            legal_moves = list(rollout_board.legal_moves)
-            rollout_board.push(random.choice(legal_moves))
-        outcome = rollout_board.result()
-        if outcome == "1-0":
-            return 1 if self.board.turn == chess.WHITE else -1
-        elif outcome == "0-1":
-            return -1 if self.board.turn == chess.WHITE else 1
-        return 0  # Draw
 
-    def backpropagate(self, result):
-        """Backpropagates the rollout result up the tree."""
+    def backup(self, value):
+        """Backpropagates the evaluation value up the tree."""
         self.visits += 1
-        self.value += result
+        self.value_sum += value
         if self.parent:
-            self.parent.backpropagate(-result)  # Invert value for opponent's turn
+            # Invert the value for the opponent.
+            self.parent.backup(-value)
 
-
-def mcts(board, simulations=100):
-    """Performs MCTS and returns the best move."""
-    root = MCTSNode(board)
-    
-    for _ in range(simulations):
+def mcts_search(board, network, action_space, num_simulations=100):
+    root = MCTSNode(board, network, action_space)
+    for _ in range(num_simulations):
         node = root
-        # Selection
-        while node.is_fully_expanded() and node.children:
-            node = node.select_child()
-        # Expansion
-        if not node.is_fully_expanded():
+        while not node.is_terminal and node.is_fully_expanded():
+            node = node.best_child()
+        if not node.is_terminal:
             node = node.expand()
-        # Rollout
-        result = node.rollout()
-        # Backpropagation
-        node.backpropagate(result)
+        if node.is_terminal:
+            outcome = node.board.result()
+            if outcome == "1-0":
+                value = 1
+            elif outcome == "0-1":
+                value = -1
+            else:
+                value = 0
+        else:
+            board_tensor = network.board_to_tensor(node.board)
+            _, value_tensor = network.forward(board_tensor)
+            value = value_tensor.item()
+        node.backup(value)
     
-    return root.best_child(exploration_weight=0).move  # Select best move without exploration
+    best_move = max(root.children.items(), key=lambda item: item[1].visits)[0]
+    return best_move
