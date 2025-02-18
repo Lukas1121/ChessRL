@@ -1,13 +1,10 @@
-# chessRL.py
-import random
 import chess
 import numpy as np
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as D
-from torch.nn.utils.rnn import pad_sequence
-from MCTS import mcts
 
 def create_action_space():
     """
@@ -15,19 +12,19 @@ def create_action_space():
     - Basic moves (all from-square to to-square combinations)
     - Pawn promotion moves (for both White and Black)
     - Castling moves (which are generated in the basic moves)
-    
+
     Returns:
         list[chess.Move]: A list of chess.Move objects representing the full action space.
     """
     action_space = []
-    
+
     # 1. Basic moves: Iterate over all possible from and to squares.
     for from_sq in chess.SQUARES:
         for to_sq in chess.SQUARES:
             move = chess.Move(from_sq, to_sq)
             if move not in action_space:
                 action_space.append(move)
-    
+
     # 2. Add promotion moves for White:
     # White pawn promotions occur when a pawn moves from rank 7 (index 6) to rank 8 (index 7).
     for from_sq in chess.SQUARES:
@@ -40,7 +37,7 @@ def create_action_space():
                             promo_move = chess.Move(from_sq, to_sq, promotion=promo)
                             if promo_move not in action_space:
                                 action_space.append(promo_move)
-    
+
     # 3. Add promotion moves for Black:
     # Black pawn promotions occur when a pawn moves from rank 2 (index 1) to rank 1 (index 0).
     for from_sq in chess.SQUARES:
@@ -52,7 +49,7 @@ def create_action_space():
                             promo_move = chess.Move(from_sq, to_sq, promotion=promo)
                             if promo_move not in action_space:
                                 action_space.append(promo_move)
-    
+
     return action_space
 
 class ChessRL:
@@ -135,10 +132,12 @@ class ChessRL:
         chess.KING: 100,
     }
     action_space = create_action_space()
+    move_to_idx = {move.uci(): idx for idx, move in enumerate(action_space)}
 
     def __init__(self, board, color):
         self.board = board
         self.board_tensor = self.board_to_tensor(board)
+        self.value_tensor = self.precompute_value_tensor() 
         self.color = color
 
     def board_to_tensor(self, board):
@@ -154,90 +153,102 @@ class ChessRL:
                 col = chess.square_file(square)
                 tensor[channel, row, col] = 1
         return tensor
+    
+    def precompute_value_tensor(self):
+        # Create a tensor of shape [12, 8, 8] for piece values (material + positional)
+        value_tensor = torch.zeros((12, 8, 8), dtype=torch.float)
+        for channel in range(12):
+            piece_type = (channel % 6) + 1  # Chess pieces are 1-indexed
+            is_white = channel < 6
+
+            material_val = self.PIECE_VALUES[piece_type]
+            # Select the appropriate piece-square table based on piece type.
+            if piece_type == chess.PAWN:
+                table = self.pawn_table
+            elif piece_type == chess.KNIGHT:
+                table = self.knight_table
+            elif piece_type == chess.BISHOP:
+                table = self.bishop_table
+            elif piece_type == chess.ROOK:
+                table = self.rook_table
+            elif piece_type == chess.QUEEN:
+                table = self.queen_table
+            elif piece_type == chess.KING:
+                table = self.king_table
+
+            if is_white:
+                # For white, use the table as-is.
+                value_tensor[channel] = material_val + table
+            else:
+                # For black, flip the table vertically and negate the value.
+                value_tensor[channel] = -(material_val + torch.flip(table, dims=[0]))
+        return value_tensor
 
     def create_legal_mask(self):
-        legal_moves_set = {move.uci() for move in self.board.legal_moves}
+        # Create a mask of zeros
         mask = torch.zeros(len(self.action_space), dtype=torch.float)
-        for idx, move in enumerate(self.action_space):
-            if move.uci() in legal_moves_set:
+        # Loop only over legal moves
+        for move in self.board.legal_moves:
+            uci_str = move.uci()
+            if uci_str in self.move_to_idx:
+                idx = self.move_to_idx[uci_str]
                 mask[idx] = 1.0
         return mask
     
-    def compute_material_score(self, board=None):
-        """
-        Evaluate the board from the perspective of self.color.
-        
-        This function sums up:
-        - The material value of each piece (from self.PIECE_VALUES), and
-        - The positional bonus/penalty from the corresponding piece-square table.
-        
-        For Black pieces, the piece-square table is flipped vertically since the tables are
-        defined from White's perspective.
-        
-        Args:
-            board (chess.Board): The board to evaluate. If None, uses self.board.
-            
-        Returns:
-            float: The evaluation score. A positive score favors White and a negative score favors Black.
-                The returned score is from the perspective of self.color.
-        """
-        if board is None:
-            board = self.board
+    def compute_material_score(self):
+        # Compute the score using vectorized multiplication.
+        total_score = torch.sum(self.board_tensor * self.value_tensor)
+        # Return the score from the perspective of the agent's color.
+        return total_score if self.color == chess.WHITE else -total_score       
 
-        total_value = 0.0
-        for square in chess.SQUARES:
-            piece = board.piece_at(square)
-            if piece is None:
-                continue
+    # def compute_material_score(self, board=None):
+    #     if board is None:
+    #         board = self.board
 
-            # Get the base material value for the piece.
-            material_value = self.PIECE_VALUES.get(piece.piece_type, 0)
-            # Get the board coordinates (row and column).
-            row = chess.square_rank(square)
-            col = chess.square_file(square)
+    #     total_value = 0.0
+    #     for square in chess.SQUARES:
+    #         piece = board.piece_at(square)
+    #         if piece is None:
+    #             continue
 
-            # Determine positional bonus based on piece type and color.
-            if piece.color == chess.WHITE:
-                if piece.piece_type == chess.PAWN:
-                    pos_value = self.pawn_table[row, col]
-                elif piece.piece_type == chess.KNIGHT:
-                    pos_value = self.knight_table[row, col]
-                elif piece.piece_type == chess.BISHOP:
-                    pos_value = self.bishop_table[row, col]
-                elif piece.piece_type == chess.ROOK:
-                    pos_value = self.rook_table[row, col]
-                elif piece.piece_type == chess.QUEEN:
-                    pos_value = self.queen_table[row, col]
-                elif piece.piece_type == chess.KING:
-                    pos_value = self.king_table[row, col]
-                # Add value for White pieces.
-                total_value += (material_value + pos_value)
-            else:
-                # For Black, flip the row since the tables are from White's perspective.
-                flipped_row = 7 - row
-                if piece.piece_type == chess.PAWN:
-                    pos_value = self.pawn_table[flipped_row, col]
-                elif piece.piece_type == chess.KNIGHT:
-                    pos_value = self.knight_table[flipped_row, col]
-                elif piece.piece_type == chess.BISHOP:
-                    pos_value = self.bishop_table[flipped_row, col]
-                elif piece.piece_type == chess.ROOK:
-                    pos_value = self.rook_table[flipped_row, col]
-                elif piece.piece_type == chess.QUEEN:
-                    pos_value = self.queen_table[flipped_row, col]
-                elif piece.piece_type == chess.KING:
-                    pos_value = self.king_table[flipped_row, col]
-                # Subtract value for Black pieces (since material is defined positively for White).
-                total_value -= (material_value + pos_value)
+    #         material_value = self.PIECE_VALUES.get(piece.piece_type, 0)
+    #         row = chess.square_rank(square)
+    #         col = chess.square_file(square)
 
-        # Return the score from the perspective of self.color.
-        # If self.color is Black, we invert the score so that a positive score always means "good" for the agent.
-        return total_value if self.color == chess.WHITE else -total_value
+    #         if piece.color == chess.WHITE:
+    #             pos_value = self.get_positional_value(piece.piece_type, row, col)
+    #             total_value += (material_value + pos_value)
+    #         else:
+    #             flipped_row = 7 - row
+    #             pos_value = self.get_positional_value(piece.piece_type, flipped_row, col)
+    #             total_value -= (material_value + pos_value)
+
+    #     # Print debug info to check if the score is symmetric
+    #     score_for_white = total_value
+    #     score_for_black = -total_value
+
+    #     return score_for_white if self.color == chess.WHITE else score_for_black
+
+    def get_positional_value(self, piece_type, row, col):
+        if piece_type == chess.PAWN:
+            return self.pawn_table[row, col]
+        elif piece_type == chess.KNIGHT:
+            return self.knight_table[row, col]
+        elif piece_type == chess.BISHOP:
+            return self.bishop_table[row, col]
+        elif piece_type == chess.ROOK:
+            return self.rook_table[row, col]
+        elif piece_type == chess.QUEEN:
+            return self.queen_table[row, col]
+        elif piece_type == chess.KING:
+            return self.king_table[row, col]
+        return 0
+
 
     def update_board(self, board):
         self.board = board
         self.board_tensor = self.board_to_tensor(board)
-        current_score = self.compute_material_score(board)
+        current_score = self.compute_material_score()
         # Compute the material difference from the previous state.
         self.material_delta = current_score - self.last_material_score
         # Update the last_material_score for the next comparison.
@@ -253,7 +264,7 @@ class ChessPolicyNet(nn.Module, ChessRL):
         self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
 
         num_actions = len(ChessRL.action_space)
-        
+
         self.fc1 = nn.Linear(64 * 8 * 8, 512)
         self.fc2 = nn.Linear(512, num_actions)
 
@@ -261,7 +272,7 @@ class ChessPolicyNet(nn.Module, ChessRL):
         self.epsilon = epsilon  # Exploration parameter.
 
         self.move_history = []
-        self.last_material_score = self.compute_material_score(board)
+        self.last_material_score = self.compute_material_score()
 
     def forward(self):
         # Use the stored board tensor; assume it’s already updated.
@@ -278,7 +289,7 @@ class ChessPolicyNet(nn.Module, ChessRL):
         masked_logits = logits + (legal_mask - 1) * 1e8
         probs = F.softmax(masked_logits, dim=-1)
         return probs
-    
+
     def _minimax(self, board, depth, alpha, beta, maximizing):
         """
         Minimax search with alpha-beta pruning.
@@ -289,13 +300,13 @@ class ChessPolicyNet(nn.Module, ChessRL):
             alpha (float): The best already explored option along the path to the root for the maximizer.
             beta (float): The best already explored option along the path to the root for the minimizer.
             maximizing (bool): True if the current node is a maximizing node.
-        
+
         Returns:
             float: The evaluation score.
         """
         # Terminal condition: depth 0 or game over.
         if depth == 0 or board.is_game_over():
-            return self.compute_material_score(board)
+            return self.compute_material_score()
 
         if maximizing:
             max_eval = -float('inf')
@@ -326,7 +337,7 @@ class ChessPolicyNet(nn.Module, ChessRL):
         - "lookahead": Uses RL with Minimax for deeper search.
         - "mcts": Uses Monte Carlo Tree Search.
         - "rl": Uses the RL network with epsilon-greedy.
-        
+
         Args:
             method (str): "lookahead", "mcts", or "rl".
             minmax_depth (int): Depth of the Minimax search (if using lookahead).
@@ -337,6 +348,7 @@ class ChessPolicyNet(nn.Module, ChessRL):
             chess.Move: The selected move.
         """
         if method == "lookahead":
+            print("lookahead")
             return self._choose_with_lookahead(minmax_depth, top_n)
         elif method == "mcts":
             return mcts(self.board, simulations)
@@ -372,15 +384,16 @@ class ChessPolicyNet(nn.Module, ChessRL):
         points = self.compute_material_score()
         self._save_move(best_move, best_index, log_prob, points, lookahead=True)
         return best_move
-    
+
     def _choose_with_rl(self):
         """Selects a move using epsilon-greedy RL policy."""
         if np.random.rand() < self.epsilon:
             legal_moves = list(self.board.legal_moves)
             move = random.choice(legal_moves)
+            action_index = self.action_space.index(move)
             dummy_log_prob = torch.tensor(0.0, device=self.device)
             points = self.compute_material_score()
-            self._save_move(move, None, dummy_log_prob, points, random=True)
+            self._save_move(move, action_index, dummy_log_prob, points)
             return move
 
         probs = self.forward()
@@ -391,10 +404,10 @@ class ChessPolicyNet(nn.Module, ChessRL):
 
         log_prob = m.log_prob(action).to(self.device)
         points = self.compute_material_score()
-        self._save_move(move, action_index, log_prob, points, random=False)
+        self._save_move(move, action_index, log_prob, points)
         return move
 
-    def _save_move(self, move, action_index, log_prob, points, lookahead=False, random=False):
+    def _save_move(self, move, action_index, log_prob, points):
         """Stores move data efficiently using tensors."""
         reward_tensor = torch.tensor([points], dtype=torch.float32, device=self.device).detach()
 
@@ -411,42 +424,67 @@ class ChessPolicyNet(nn.Module, ChessRL):
         self.move_history_tensors["action_indices"] = torch.cat([self.move_history_tensors["action_indices"], torch.tensor([action_index], dtype=torch.long, device=self.device)])
 
     def clear_move_history(self):
-        """Resets stored move history tensors for efficient training."""
         self.move_history_tensors = {
             "log_probs": torch.empty(0, dtype=torch.float32, device=self.device),
             "rewards": torch.empty(0, dtype=torch.float32, device=self.device),
             "action_indices": torch.empty(0, dtype=torch.long, device=self.device),
         }
 
-    def reinforce_update(self, optimizer, gamma=0.99):
+    def reinforce_update(self, optimizer, game_histories, gamma=0.99):
         """
-        Perform a REINFORCE update using batched tensors.
+        Perform a REINFORCE update using a batch of game histories.
+
+        Args:
+            optimizer: The optimizer for updating the network.
+            game_histories: A list of dictionaries, one per game, each containing:
+                - "log_probs": Tensor of shape [num_moves]
+                - "rewards": Tensor of shape [num_moves]
+                - "action_indices": (optional) Tensor of shape [num_moves]
+            gamma: Discount factor.
+
+        Returns:
+            The average loss (float) computed over the batch.
         """
-        if len(self.move_history_tensors["log_probs"]) == 0:
+        losses = []
+
+        # Process each game individually
+        for history in game_histories:
+            log_probs = history["log_probs"]  # shape: [n_moves]
+            rewards = history["rewards"]      # shape: [n_moves]
+
+            # Skip if empty history
+            if rewards.numel() == 0:
+                continue
+
+            # Create discount factors [1, gamma, gamma^2, ...]
+            discounts = torch.tensor([gamma**i for i in range(len(rewards))],
+                                    dtype=torch.float32,
+                                    device=self.device)
+
+            # Compute discounted returns:
+            # First, multiply rewards by discount factors,
+            # then compute the cumulative sum in reverse order,
+            # and finally flip back.
+            returns = torch.flip(torch.cumsum(torch.flip(rewards * discounts, dims=[0]), dim=0), dims=[0])
+
+            # Normalize returns for this game
+            returns = (returns - returns.mean()) / (returns.std() + 1e-9)
+
+            # Compute loss for the game
+            loss = (-log_probs * returns).mean()
+            losses.append(loss)
+
+        if len(losses) == 0:
             print("No move history found! Skipping update.")
-            return 0.0  
+            return 0.0
 
-        # Retrieve tensors
-        log_probs = self.move_history_tensors["log_probs"]
-        rewards = self.move_history_tensors["rewards"]
+        # Average the losses over all games
+        total_loss = torch.stack(losses).mean()
 
-        # Compute discounted returns in a vectorized way
-        discounts = torch.tensor([gamma**i for i in range(len(rewards))], device=self.device)
-        returns = torch.flip(torch.cumsum(torch.flip(rewards * discounts, [0]), 0), [0])
-
-        # Normalize returns
-        returns = (returns - returns.mean()) / (returns.std() + 1e-9)
-
-        # Compute batch loss
-        loss = (-log_probs * returns).mean()
-
-        # Backpropagation
+        # Perform backpropagation and update the network
         optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
         optimizer.step()
 
-        # Clear move history
-        self.clear_move_history()
-
-        print(f"REINFORCE loss: {loss.item():.4f}")
-        return loss.item()
+        print(f"REINFORCE loss: {total_loss.item():.4f}")
+        return total_loss.item()
