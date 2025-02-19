@@ -9,3 +9,5 @@
 !__init__.py
 !MCTS.py
 !notes.txt
+!hf.py
+!ChessRL_test.py

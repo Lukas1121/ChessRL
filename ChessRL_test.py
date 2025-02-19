@@ -215,33 +215,9 @@ class ChessRL:
             return self.king_table[row, col]
         return 0
 
-
     def update_board(self, board):
         self.board = board
         self.board_tensor = self.board_to_tensor(board)
-
-    def _save_move(self, move, action_index, log_prob, points):
-        """Stores move data efficiently using tensors."""
-        reward_tensor = torch.tensor([points], dtype=torch.float32, device=self.device).detach()
-
-        # Append move data as a single tensor batch
-        if not hasattr(self, "move_history_tensors"):
-            self.move_history_tensors = {
-                "log_probs": torch.empty(0, dtype=torch.float32, device=self.device),
-                "rewards": torch.empty(0, dtype=torch.float32, device=self.device),
-                "action_indices": torch.empty(0, dtype=torch.long, device=self.device),
-            }
-
-        self.move_history_tensors["log_probs"] = torch.cat([self.move_history_tensors["log_probs"], log_prob.view(1)])
-        self.move_history_tensors["rewards"] = torch.cat([self.move_history_tensors["rewards"], reward_tensor])
-        self.move_history_tensors["action_indices"] = torch.cat([self.move_history_tensors["action_indices"], torch.tensor([action_index], dtype=torch.long, device=self.device)])
-
-    def clear_move_history(self):
-        self.move_history_tensors = {
-            "log_probs": torch.empty(0, dtype=torch.float32, device=self.device),
-            "rewards": torch.empty(0, dtype=torch.float32, device=self.device),
-            "action_indices": torch.empty(0, dtype=torch.long, device=self.device),
-        }
 
 class ChessPolicyNet(nn.Module, ChessRL):
     def __init__(self, board, color, device, non_capture_penalty=-0.2, epsilon=0.1):
@@ -279,124 +255,26 @@ class ChessPolicyNet(nn.Module, ChessRL):
         probs = F.softmax(masked_logits, dim=-1)
         return probs
 
-    # def _minimax(self, board, depth, alpha, beta, maximizing):
-    #     """
-    #     Minimax search with alpha-beta pruning.
-
-    #     Args:
-    #         board (chess.Board): The board state to evaluate.
-    #         depth (int): How many plies to search.
-    #         alpha (float): The best already explored option along the path to the root for the maximizer.
-    #         beta (float): The best already explored option along the path to the root for the minimizer.
-    #         maximizing (bool): True if the current node is a maximizing node.
-
-    #     Returns:
-    #         float: The evaluation score.
-    #     """
-    #     # Terminal condition: depth 0 or game over.
-    #     if depth == 0 or board.is_game_over():
-    #         return self.compute_material_score()
-
-    #     if maximizing:
-    #         max_eval = -float('inf')
-    #         for move in board.legal_moves:
-    #             board.push(move)
-    #             eval_value = self._minimax(board, depth - 1, alpha, beta, False)
-    #             board.pop()
-    #             max_eval = max(max_eval, eval_value)
-    #             alpha = max(alpha, eval_value)
-    #             if beta <= alpha:
-    #                 break  # Beta cutoff
-    #         return max_eval
-    #     else:
-    #         min_eval = float('inf')
-    #         for move in board.legal_moves:
-    #             board.push(move)
-    #             eval_value = self._minimax(board, depth - 1, alpha, beta, True)
-    #             board.pop()
-    #             min_eval = min(min_eval, eval_value)
-    #             beta = min(beta, eval_value)
-    #             if beta <= alpha:
-    #                 break  # Alpha cutoff
-    #         return min_eval
-
-    # def choose_move(self, method="rl", minmax_depth=2, top_n=3, simulations=100):
-    #     """
-    #     Selects a move using one of three methods:
-    #     - "lookahead": Uses RL with Minimax for deeper search.
-    #     - "mcts": Uses Monte Carlo Tree Search.
-    #     - "rl": Uses the RL network with epsilon-greedy.
-
-    #     Args:
-    #         method (str): "lookahead", "mcts", or "rl".
-    #         minmax_depth (int): Depth of the Minimax search (if using lookahead).
-    #         top_n (int): Number of candidate moves to evaluate (for Minimax).
-    #         simulations (int): Number of simulations for MCTS.
-
-    #     Returns:
-    #         chess.Move: The selected move.
-    #     """
-    #     if method == "lookahead":
-    #         print("lookahead")
-    #         return self._choose_with_lookahead(minmax_depth, top_n)
-    #     elif method == "mcts":
-    #         return mcts(self.board, simulations)
-    #     else:  # Default: RL with epsilon-greedy
-    #         return self._choose_with_rl()
-
-    # def _choose_with_lookahead(self, minmax_depth, top_n):
-        """Selects a move using RL-based move probabilities combined with Minimax lookahead."""
-        probs = self.forward()  # Get action probabilities
-        probs_np = probs.cpu().detach().numpy().flatten()
-        top_indices = probs_np.argsort()[-top_n:][::-1]  # Select top N moves
-
-        candidate_moves = []
-        candidate_indices = []
-        for idx in top_indices:
-            move = self.action_space[idx]
-            if move in self.board.legal_moves:
-                candidate_moves.append(move)
-                candidate_indices.append(idx)
-        if not candidate_moves:
-            candidate_moves = list(self.board.legal_moves)
-            candidate_indices = [self.action_space.index(move) for move in candidate_moves]
-
-        best_move, best_eval, best_index = None, None, None
-        for idx, move in zip(candidate_indices, candidate_moves):
-            self.board.push(move)
-            eval_value = self._minimax(self.board, minmax_depth, -float('inf'), float('inf'), maximizing=(self.board.turn == self.color))
-            self.board.pop()
-            if best_move is None or (self.color == chess.WHITE and eval_value > best_eval) or (self.color == chess.BLACK and eval_value < best_eval):
-                best_move, best_eval, best_index = move, eval_value, idx
-
-        log_prob = torch.distributions.Categorical(probs).log_prob(torch.tensor(best_index, device=self.device))
-        points = self.compute_material_score()
-        self._save_move(best_move, best_index, log_prob, points, lookahead=True)
-        return best_move
-
     def choose_move(self):
         """Selects a move using epsilon-greedy RL policy."""
+        probs = self.forward()  # Compute network output regardless
         if np.random.rand() < self.epsilon:
             legal_moves = list(self.board.legal_moves)
             move = random.choice(legal_moves)
             action_index = self.action_space.index(move)
-            dummy_log_prob = torch.tensor(0.0, device=self.device)
-            points = self.compute_material_score()
-            self._save_move(move, action_index, dummy_log_prob, points)
-            return move
+            # Compute the log probability from the network's output even for a random move
+            log_prob = torch.log(probs[0, action_index] + 1e-8).to(self.device)
+            return move, log_prob
 
-        probs = self.forward()
         m = D.Categorical(probs)
         action = m.sample()
         action_index = action.item()
         move = self.action_space[action_index]
-
         log_prob = m.log_prob(action).to(self.device)
-        points = self.compute_material_score()
-        self._save_move(move, action_index, log_prob, points)
-        return move
+        return move, log_prob
 
-    def reinforce_update(self, optimizer, game_histories, gamma=0.99):
+
+    def reinforce_update(self, optimizer, samples, gamma=0.99):
         """
         Perform a REINFORCE update using a batch of game histories.
 
@@ -414,9 +292,9 @@ class ChessPolicyNet(nn.Module, ChessRL):
         losses = []
 
         # Process each game individually
-        for history in game_histories:
-            log_probs = history["log_probs"]  # shape: [n_moves]
-            rewards = history["rewards"]      # shape: [n_moves]
+        for sample in samples:
+            log_probs = sample["log_probs"]  # shape: [n_moves]
+            rewards = sample["rewards"]      # shape: [n_moves]
 
             # Skip if empty history
             if rewards.numel() == 0:
@@ -427,10 +305,6 @@ class ChessPolicyNet(nn.Module, ChessRL):
                                     dtype=torch.float32,
                                     device=self.device)
 
-            # Compute discounted returns:
-            # First, multiply rewards by discount factors,
-            # then compute the cumulative sum in reverse order,
-            # and finally flip back.
             returns = torch.flip(torch.cumsum(torch.flip(rewards * discounts, dims=[0]), dim=0), dims=[0])
 
             # Normalize returns for this game
