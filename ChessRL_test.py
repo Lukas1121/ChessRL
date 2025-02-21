@@ -182,6 +182,12 @@ class ChessRL:
                 # For black, flip the table vertically and negate the value.
                 value_tensor[channel] = -(material_val + torch.flip(table, dims=[0]))
         return value_tensor
+    
+    def compute_material_score(self):
+        # Compute the score using vectorized multiplication.
+        total_score = torch.sum(self.board_tensor * self.value_tensor)
+        # Return the score from the perspective of the agent's color.
+        return total_score if self.color == chess.WHITE else -total_score       
 
     def create_legal_mask(self):
         # Create a mask of zeros
@@ -193,27 +199,6 @@ class ChessRL:
                 idx = self.move_to_idx[uci_str]
                 mask[idx] = 1.0
         return mask
-    
-    def compute_material_score(self):
-        # Compute the score using vectorized multiplication.
-        total_score = torch.sum(self.board_tensor * self.value_tensor)
-        # Return the score from the perspective of the agent's color.
-        return total_score if self.color == chess.WHITE else -total_score       
-
-    def get_positional_value(self, piece_type, row, col):
-        if piece_type == chess.PAWN:
-            return self.pawn_table[row, col]
-        elif piece_type == chess.KNIGHT:
-            return self.knight_table[row, col]
-        elif piece_type == chess.BISHOP:
-            return self.bishop_table[row, col]
-        elif piece_type == chess.ROOK:
-            return self.rook_table[row, col]
-        elif piece_type == chess.QUEEN:
-            return self.queen_table[row, col]
-        elif piece_type == chess.KING:
-            return self.king_table[row, col]
-        return 0
 
     def update_board(self, board):
         self.board = board
@@ -274,43 +259,34 @@ class ChessPolicyNet(nn.Module, ChessRL):
         return move, log_prob
 
 
-    def reinforce_update(self, optimizer, samples, gamma=0.99):
+    def reinforce_update(self, optimizer, game_histories, gamma=0.99):
         """
         Perform a REINFORCE update using a batch of game histories.
-
-        Args:
-            optimizer: The optimizer for updating the network.
-            game_histories: A list of dictionaries, one per game, each containing:
-                - "log_probs": Tensor of shape [num_moves]
-                - "rewards": Tensor of shape [num_moves]
-                - "action_indices": (optional) Tensor of shape [num_moves]
-            gamma: Discount factor.
-
-        Returns:
-            The average loss (float) computed over the batch.
+        Each game history is a list of move dictionaries.
         """
         losses = []
 
-        # Process each game individually
-        for sample in samples:
-            log_probs = sample["log_probs"]  # shape: [n_moves]
-            rewards = sample["rewards"]      # shape: [n_moves]
+        # Process each game individually.
+        for game in game_histories:
+            if not game:
+                continue
 
-            # Skip if empty history
+            # Extract log probabilities and rewards for each move in the game.
+            log_probs = torch.stack([move["policy_info"] for move in game])
+            rewards = torch.tensor([move["reward"] for move in game],
+                                dtype=torch.float32, device=self.device)
+
             if rewards.numel() == 0:
                 continue
 
-            # Create discount factors [1, gamma, gamma^2, ...]
+            # Create discount factors: [1, gamma, gamma^2, ...]
             discounts = torch.tensor([gamma**i for i in range(len(rewards))],
-                                    dtype=torch.float32,
-                                    device=self.device)
-
+                                    dtype=torch.float32, device=self.device)
+            # Compute discounted returns.
             returns = torch.flip(torch.cumsum(torch.flip(rewards * discounts, dims=[0]), dim=0), dims=[0])
-
-            # Normalize returns for this game
+            # Normalize returns.
             returns = (returns - returns.mean()) / (returns.std() + 1e-9)
-
-            # Compute loss for the game
+            # Compute loss.
             loss = (-log_probs * returns).mean()
             losses.append(loss)
 
@@ -318,16 +294,15 @@ class ChessPolicyNet(nn.Module, ChessRL):
             print("No move history found! Skipping update.")
             return 0.0
 
-        # Average the losses over all games
         total_loss = torch.stack(losses).mean()
 
-        # Perform backpropagation and update the network
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
 
         print(f"REINFORCE loss: {total_loss.item():.4f}")
         return total_loss.item()
+
 
 class ChessHybridNet(nn.Module,ChessRL):
     def __init__(self, board, color, device):
