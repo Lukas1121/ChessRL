@@ -205,7 +205,7 @@ class ChessRL:
         self.board_tensor = self.board_to_tensor(board)
 
 class ChessPolicyNet(nn.Module, ChessRL):
-    def __init__(self, board, color, device, non_capture_penalty=-0.2, epsilon=0.1):
+    def __init__(self, board, color, device, epsilon=0.1):
         nn.Module.__init__(self)
         ChessRL.__init__(self, board, color)
         # Define convolutional layers:
@@ -218,7 +218,6 @@ class ChessPolicyNet(nn.Module, ChessRL):
         self.fc1 = nn.Linear(64 * 8 * 8, 512)
         self.fc2 = nn.Linear(512, num_actions)
 
-        self.non_capture_penalty = non_capture_penalty
         self.epsilon = epsilon  # Exploration parameter.
 
         self.move_history = []
@@ -242,58 +241,83 @@ class ChessPolicyNet(nn.Module, ChessRL):
 
     def choose_move(self):
         """Selects a move using epsilon-greedy RL policy."""
-        probs = self.forward()  # Compute network output regardless
-        if np.random.rand() < self.epsilon:
+        probs = self.forward()  # expected shape: [1, num_actions], with gradient tracking
+        
+        # Use torch.rand for randomness to keep everything in the torch ecosystem.
+        if torch.rand(1).item() < self.epsilon:
+            # Epsilon branch: choose a random legal move.
             legal_moves = list(self.board.legal_moves)
             move = random.choice(legal_moves)
             action_index = self.action_space.index(move)
-            # Compute the log probability from the network's output even for a random move
-            log_prob = torch.log(probs[0, action_index] + 1e-8).to(self.device)
+            # Compute the log probability from the network's output in a differentiable manner.
+            # Note: We do NOT call .item() or detach(), so gradients flow back to probs.
+            log_prob = torch.log(probs[0, action_index] + 1e-8)
             return move, log_prob
-
-        m = D.Categorical(probs)
-        action = m.sample()
-        action_index = action.item()
-        move = self.action_space[action_index]
-        log_prob = m.log_prob(action).to(self.device)
-        return move, log_prob
+        else:
+            # Policy branch: sample from the categorical distribution defined by probs.
+            m = D.Categorical(probs)
+            action = m.sample()
+            action_index = action.item()
+            move = self.action_space[action_index]
+            # m.log_prob(action) returns a tensor that tracks gradients.
+            log_prob = m.log_prob(action)
+            return move, log_prob
 
 
     def reinforce_update(self, optimizer, game_histories, gamma=0.99):
         """
         Perform a REINFORCE update using a batch of game histories.
-        Each game history is a list of move dictionaries.
+        
+        Args:
+            optimizer: The optimizer for updating the network.
+            game_histories: A list where each element is a list of move dictionaries.
+                            Each move dictionary should contain:
+                            - "policy_info": a tensor (scalar or [1]) representing the log probability.
+                            - "reward": a scalar reward for that move.
+            gamma: Discount factor.
+        
+        Returns:
+            The average loss (float) computed over the batch.
         """
         losses = []
 
         # Process each game individually.
         for game in game_histories:
-            if not game:
+            if len(game) == 0:
                 continue
 
-            # Extract log probabilities and rewards for each move in the game.
-            log_probs = torch.stack([move["policy_info"] for move in game])
-            rewards = torch.tensor([move["reward"] for move in game],
-                                dtype=torch.float32, device=self.device)
+            # Extract and fix log probabilities for each move.
+            log_probs = [move["policy_info"].squeeze() for move in game]
+            log_probs_tensor = torch.stack(log_probs)  # shape: [num_moves]
+            
+            # Extract rewards as a tensor.
+            rewards_tensor = torch.tensor([move["reward"] for move in game],
+                                        dtype=torch.float32,
+                                        device=self.device)
 
-            if rewards.numel() == 0:
+            if rewards_tensor.numel() == 0:
                 continue
 
             # Create discount factors: [1, gamma, gamma^2, ...]
-            discounts = torch.tensor([gamma**i for i in range(len(rewards))],
-                                    dtype=torch.float32, device=self.device)
-            # Compute discounted returns.
-            returns = torch.flip(torch.cumsum(torch.flip(rewards * discounts, dims=[0]), dim=0), dims=[0])
-            # Normalize returns.
+            discounts = torch.tensor([gamma ** i for i in range(len(rewards_tensor))],
+                                    dtype=torch.float32,
+                                    device=self.device)
+            # Compute discounted rewards and cumulative returns.
+            discounted_rewards = rewards_tensor * discounts
+            returns = torch.flip(torch.cumsum(torch.flip(discounted_rewards, dims=[0]), dim=0), dims=[0])
+            
+            # Normalize returns for this game.
             returns = (returns - returns.mean()) / (returns.std() + 1e-9)
-            # Compute loss.
-            loss = (-log_probs * returns).mean()
+            
+            # Compute loss for this game.
+            loss = (-log_probs_tensor * returns).mean()
             losses.append(loss)
 
         if len(losses) == 0:
             print("No move history found! Skipping update.")
             return 0.0
 
+        # Average the losses over all games.
         total_loss = torch.stack(losses).mean()
 
         optimizer.zero_grad()

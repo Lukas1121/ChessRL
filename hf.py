@@ -15,44 +15,92 @@ else:
     print("GPU not available, using CPU instead.")
 import matplotlib.pyplot as plt
 
-def separate_and_evaluate_game_histories(game_histories, agent_white, agent_black):
+def separate_and_evaluate_game_histories(game_histories, results, terminal_reward, per_move_penalty, agent_white, agent_black):
     """
-    Given a list of game histories (each a list of move sample dicts) and two agents,
-    compute the reward for each move and separate the moves into white and black game histories.
+    Given a list of game histories (each a list of move sample dicts), the game results,
+    and a terminal reward, compute the reward for each move and separate the moves into
+    white and black game histories.
     
-    Each move sample is expected to contain at least:
+    Each move sample is expected to contain:
       - 'state': a torch.Tensor of shape [12, 8, 8]
       - 'policy_info': the output from move selection (e.g. log_prob)
     
-    The reward is computed as sum(state * value_tensor). For white moves it's used as-is,
-    for black moves the sign is flipped.
+    For each move, an intermediate reward is computed as:
+         reward = sum(state * value_tensor)
+    where value_tensor is computed via the agent's precompute_value_tensor() method.
+    For white moves the reward is used as-is, while for black moves its sign is flipped.
+    
+    Additionally, based on the final game result (from the results list) the terminal reward is applied:
+      - For a white win ("1-0"): the last white move's reward is increased by terminal_reward,
+        and the last black move's reward is decreased by terminal_reward.
+      - For a black win ("0-1"): the last white move's reward is decreased by terminal_reward,
+        and the last black move's reward is increased by terminal_reward.
+      - For a draw ("1/2-1/2"): no terminal reward is applied.
+      
+    The final score for each game is defined as:
+      - White win ("1-0"): white = terminal_reward, black = -terminal_reward.
+      - Black win ("0-1"): white = -terminal_reward, black = terminal_reward.
+      - Draw ("1/2-1/2"): white = 0, black = 0.
     
     Returns:
       - white_game_histories: List of game histories (one per game) for white moves.
       - black_game_histories: List of game histories (one per game) for black moves.
+      - avg_white_points: The average final score for white across the batch.
+      - avg_black_points: The average final score for black across the batch.
     """
     white_value_tensor = agent_white.precompute_value_tensor()
     black_value_tensor = agent_black.precompute_value_tensor()
 
     white_game_histories = []
     black_game_histories = []
+    white_final_scores = []
+    black_final_scores = []
     
-    for game in game_histories:
+    for game_index, game in enumerate(game_histories):
         white_moves = []
         black_moves = []
+        # Compute intermediate rewards for each move.
         for i, sample in enumerate(game):
-            if i % 2 == 0:  # Even index: white's move.
+            if i % 2 == 0:  # White's move.
                 reward = torch.sum(sample['state'] * white_value_tensor).item()
                 sample['reward'] = reward
                 white_moves.append(sample)
-            else:           # Odd index: black's move.
+            else:           # Black's move.
                 reward = -torch.sum(sample['state'] * black_value_tensor).item()
                 sample['reward'] = reward
                 black_moves.append(sample)
+        
+        # Adjust final move rewards with terminal reward.
+        result = results[game_index]
+        if result == "1-0":
+            if white_moves:
+                white_moves[-1]['reward'] += terminal_reward
+            if black_moves:
+                black_moves[-1]['reward'] -= terminal_reward
+            white_final = terminal_reward
+            black_final = -terminal_reward
+        elif result == "0-1":
+            if white_moves:
+                white_moves[-1]['reward'] -= terminal_reward
+            if black_moves:
+                black_moves[-1]['reward'] += terminal_reward
+            white_final = -terminal_reward
+            black_final = terminal_reward
+        else:  # Draw ("1/2-1/2")
+            draw_penalty = -per_move_penalty * len(game)
+            white_final = draw_penalty
+            black_final = draw_penalty
+
         white_game_histories.append(white_moves)
         black_game_histories.append(black_moves)
+        white_final_scores.append(white_final)
+        black_final_scores.append(black_final)
     
-    return white_game_histories, black_game_histories
+    white_avg_points = np.mean(white_final_scores) if white_final_scores else 0
+    black_avg_points = np.mean(black_final_scores) if black_final_scores else 0
+
+    return white_game_histories, black_game_histories, white_avg_points, black_avg_points
+
 
 
 def generate_self_play_samples(agent_white, agent_black, config):
@@ -95,13 +143,15 @@ def generate_self_play_samples(agent_white, agent_black, config):
 
     return samples, result
 
-def train_chess_networks_modular(
+def train_chess_networks_RL(
     num_iterations=400,
     games_per_iteration=5,
     epsilon_initial=0.3,
     epsilon_final=0.1,
     lr=0.0004,
     gamma=0.95,
+    per_move_penalty=1,
+    terminal_reward = 200,
     pretrained_model_path_white=None,
     pretrained_model_path_black=None,
     config=None  # Should include any necessary parameters such as config.move_kwargs
@@ -111,14 +161,12 @@ def train_chess_networks_modular(
         board=chess.Board(),
         color=chess.WHITE,
         device=device,
-        non_capture_penalty=-1,
         epsilon=epsilon_initial
     ).to(device)
     agent_black = ChessPolicyNet(
         board=chess.Board(),
         color=chess.BLACK,
         device=device,
-        non_capture_penalty=-1,
         epsilon=epsilon_initial
     ).to(device)
     
@@ -163,35 +211,13 @@ def train_chess_networks_modular(
             samples, result = generate_self_play_samples(agent_white, agent_black, config)
             game_lengths.append(len(samples))
             results.append(result)
-            print(f"result: {results}")
+            print(results[-1])
             
             # (Optionally, you could split samples based on turn or agent.)
             game_histories.append(samples)
 
-        white_game_histories, black_game_histories = separate_and_evaluate_game_histories(game_histories, agent_white, agent_black)
+        white_game_histories, black_game_histories, white_avg_points, black_avg_points = separate_and_evaluate_game_histories(game_histories, results, terminal_reward, per_move_penalty, agent_white, agent_black)
 
-        print("=== White Game Histories Summary ===")
-        total_games = len(white_game_histories)
-        total_moves = sum(len(game) for game in white_game_histories)
-        print(f"Total games: {total_games}")
-        print(f"Total moves: {total_moves}")
-
-        for game_idx, game in enumerate(white_game_histories, start=1):
-            print(f"\nGame {game_idx}: {len(game)} moves")
-            # Print details for the first 3 moves of each game (adjust as needed)
-            for move_idx, move in enumerate(game, start=1):
-                state_shape = move['state'].shape if 'state' in move else "N/A"
-                policy_info = move.get('policy_info', "N/A")
-                reward = move.get('reward', "Not computed")
-                print(f"  Move {move_idx}:")
-                print(f"    State shape   : {state_shape}")
-                print(f"    Policy info   : {policy_info}")
-                print(f"    Reward        : {reward}")
-                # Only print a few moves to avoid flooding the output.
-                if move_idx == 3:
-                    if len(game) > 3:
-                        print("    ...")
-                    break
         white_loss = agent_white.reinforce_update(optimizer_white, white_game_histories, gamma=gamma)
         black_loss = agent_black.reinforce_update(optimizer_black, black_game_histories, gamma=gamma)
 
@@ -204,19 +230,16 @@ def train_chess_networks_modular(
         metrics["black_win_rates"].append(black_wins / total_games)
         metrics["draw_rates"].append(draws / total_games)
         metrics["game_length_list"].append(np.mean(game_lengths))
-
-        white_loss = agent_white.reinforce_update(agent_white, optimizer_white, white_game_histories, gamma=gamma, device=device)
-        black_loss = agent_black.reinforce_update(agent_black, optimizer_black, black_game_histories, gamma=gamma, device=device)
-
         metrics["white_loss_list"].append(white_loss)
         metrics["black_loss_list"].append(black_loss)
+        metrics["white_avg_points"].append(white_avg_points)
+        metrics["black_avg_points"].append(black_avg_points)
 
-        # Optionally, compute average points (if you're using material scores elsewhere).
         # For now, we'll just record loss and win rates.
-        print(f"Iteration {iteration+1} completed: Avg Length {avg_game_length:.2f}, White Loss {white_loss:.4f}, Black Loss {black_loss:.4f}")
+        print(f"Iteration {iteration+1} completed: Avg Length {np.mean(game_lengths):.2f}, White Loss {white_loss:.4f}, Black Loss {black_loss:.4f}")
 
     # Optionally, save your metrics to disk.
-    save_models_and_metrics(policy_net_white=agent_white, policy_net_black=agent_black, save_to_drive=save_to_drive, metrics=metrics)
+    save_models_and_metrics(policy_net_white=agent_white, policy_net_black=agent_black, metrics=metrics)
 
     return metrics
 
@@ -240,10 +263,10 @@ def save_models_and_metrics(policy_net_white, policy_net_black, metrics, base_di
     print(f"Models saved in {save_dir}")
     
     # Plot the metrics and save the plot.
-    plot_training_metrics_binned(metrics)
+    fig = plot_training_metrics_binned(metrics)
     plot_path = os.path.join(save_dir, "training_metrics.png")
-    plt.savefig(plot_path)
-    plt.close()  # Close the figure to free up memory
+    fig.savefig(plot_path)
+    plt.close(fig)  # Close the figure to free up memory
     print(f"Training metrics plot saved in {plot_path}")
 
 def bin_data(data, num_bins):
@@ -340,4 +363,4 @@ def plot_training_metrics_binned(metrics, num_bins=20):
     axs[1, 0].grid(True)
 
     plt.tight_layout()
-    plt.show()
+    return fig
