@@ -205,34 +205,38 @@ class ChessRL:
         self.board_tensor = self.board_to_tensor(board)
 
 class ChessPolicyNet(nn.Module, ChessRL):
-    def __init__(self, board, color, device, epsilon=0.1):
+    def __init__(self, board, color, device,layers=10, epsilon=0.1):
         nn.Module.__init__(self)
         ChessRL.__init__(self, board, color)
-        # Define convolutional layers:
         self.device = device
-        self.conv1 = nn.Conv2d(in_channels=12, out_channels=32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
-
+        
+        # Build a sequential container for 10 conv layers.
+        conv_layers = []
+        # First layer: input channels 12 -> 32
+        conv_layers.append(nn.Conv2d(12, 32, kernel_size=3, padding=1))
+        conv_layers.append(nn.ReLU())
+        # Next 9 layers: keep 32 channels throughout.
+        for _ in range(layers-1):
+            conv_layers.append(nn.Conv2d(32, 32, kernel_size=3, padding=1))
+            conv_layers.append(nn.ReLU())
+        self.conv_layers = nn.Sequential(*conv_layers)
+        
         num_actions = len(ChessRL.action_space)
-
-        self.fc1 = nn.Linear(64 * 8 * 8, 512)
+        # Adjust the fully connected layer to match the conv output: 32 channels * 8 * 8.
+        self.fc1 = nn.Linear(32 * 8 * 8, 512)
         self.fc2 = nn.Linear(512, num_actions)
-
+        
         self.epsilon = epsilon  # Exploration parameter.
 
-        self.move_history = []
-        self.last_material_score = self.compute_material_score()
 
     def forward(self):
-        # Use the stored board tensor; assume it’s already updated.
-        # Add batch dimension if necessary.
-        x = self.board_tensor.to(self.device).unsqueeze(0)  # Now x has shape (1, 12, 8, 8)
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = x.view(x.size(0), -1)
+        # Assume board_tensor is up-to-date and has shape (12, 8, 8).
+        x = self.board_tensor.to(self.device).unsqueeze(0)  # Shape: (1, 12, 8, 8)
+        x = self.conv_layers(x)  # Pass through the 10 conv layers.
+        x = x.view(x.size(0), -1)  # Flatten.
         x = F.relu(self.fc1(x))
         logits = self.fc2(x)
-        # Generate legal mask and apply it.
+        # Apply legal move mask.
         legal_mask = self.create_legal_mask().to(self.device)  # Shape: (num_actions,)
         legal_mask = legal_mask.unsqueeze(0).expand_as(logits)
         masked_logits = logits + (legal_mask - 1) * 1e8
@@ -241,27 +245,20 @@ class ChessPolicyNet(nn.Module, ChessRL):
 
     def choose_move(self):
         """Selects a move using epsilon-greedy RL policy."""
-        probs = self.forward()  # expected shape: [1, num_actions], with gradient tracking
-        
-        # Use torch.rand for randomness to keep everything in the torch ecosystem.
-        if torch.rand(1).item() < self.epsilon:
-            # Epsilon branch: choose a random legal move.
+        probs = self.forward()
+        if np.random.rand() < self.epsilon:
             legal_moves = list(self.board.legal_moves)
             move = random.choice(legal_moves)
             action_index = self.action_space.index(move)
-            # Compute the log probability from the network's output in a differentiable manner.
-            # Note: We do NOT call .item() or detach(), so gradients flow back to probs.
-            log_prob = torch.log(probs[0, action_index] + 1e-8)
+            log_prob = torch.log(probs[0, action_index] + 1e-8).to(self.device)
             return move, log_prob
-        else:
-            # Policy branch: sample from the categorical distribution defined by probs.
-            m = D.Categorical(probs)
-            action = m.sample()
-            action_index = action.item()
-            move = self.action_space[action_index]
-            # m.log_prob(action) returns a tensor that tracks gradients.
-            log_prob = m.log_prob(action)
-            return move, log_prob
+
+        m = D.Categorical(probs)
+        action = m.sample()
+        action_index = action.item()
+        move = self.action_space[action_index]
+        log_prob = m.log_prob(action).to(self.device)
+        return move, log_prob
 
 
     def reinforce_update(self, optimizer, game_histories, gamma=0.99):
@@ -328,26 +325,108 @@ class ChessPolicyNet(nn.Module, ChessRL):
         return total_loss.item()
 
 
-class ChessHybridNet(nn.Module,ChessRL):
-    def __init__(self, board, color, device):
+class ChessHybridNet(nn.Module, ChessRL):
+    def __init__(self, board, color, device, layers=2):
+        """
+        If layers == 2, the network uses the original two conv layers:
+          - conv1: 12 -> 32 channels
+          - conv2: 32 -> 64 channels
+        If layers > 2, the network will have one initial layer (12->32),
+        then (layers-2) additional layers maintaining 32 channels,
+        and finally one layer mapping 32 -> 64 channels.
+        """
         nn.Module.__init__(self)
         ChessRL.__init__(self, board, color)
         self.device = device
-        self.conv1 = nn.Conv2d(in_channels=12, out_channels=32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
-        self.fc1 = nn.Linear(64 * 8 * 8, 512)
+
+        conv_layers = []
+        # First layer: convert input channels (12) to 32.
+        conv_layers.append(nn.Conv2d(in_channels=12, out_channels=32, kernel_size=3, padding=1))
+        conv_layers.append(nn.ReLU())
         
+        if layers > 2:
+            # Add (layers - 2) intermediate layers with 32 channels.
+            for _ in range(layers - 2):
+                conv_layers.append(nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, padding=1))
+                conv_layers.append(nn.ReLU())
+        
+        # Final layer: convert 32 channels to 64 channels.
+        conv_layers.append(nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1))
+        conv_layers.append(nn.ReLU())
+        
+        self.conv_layers = nn.Sequential(*conv_layers)
+        
+        # After the conv layers, the spatial dimensions remain 8x8.
+        self.fc1 = nn.Linear(64 * 8 * 8, 512)
         num_actions = len(ChessRL.action_space)
         self.policy_head = nn.Linear(512, num_actions)
         self.value_head = nn.Linear(512, 1)
-    
+
+    def choose_move(self, num_simulations=10):
+        best_move, policy_info = mcts_search(self.board, self, self.action_space, num_simulations)
+        return best_move, policy_info
+
     def forward(self, board_tensor):
-        x = board_tensor.to(self.device).unsqueeze(0)  # (1, 12, 8, 8)
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = x.view(x.size(0), -1)
+        # Input: board_tensor with shape (12, 8, 8).
+        x = board_tensor.to(self.device).unsqueeze(0)  # Now shape: (1, 12, 8, 8)
+        x = self.conv_layers(x)                       # Process through conv layers.
+        x = x.view(x.size(0), -1)                       # Flatten to shape: (1, 64*8*8)
         x = F.relu(self.fc1(x))
         policy_logits = self.policy_head(x)
-        value = torch.tanh(self.value_head(x))  # value in [-1,1]
+        value = torch.tanh(self.value_head(x))          # Value in range [-1,1]
         return F.softmax(policy_logits, dim=-1), value
 
+    def reinforce_update(self, optimizer, game_histories):
+        """
+        Perform an update on the hybrid network using self-play samples.
+        Each move dictionary in game_histories should have:
+        - "state": a board tensor (e.g. [12,8,8])
+        - "policy_info": a target policy distribution (numpy array of shape [num_actions])
+        - "target_value": the final outcome from the perspective of the moving agent.
+        
+        Returns:
+            The average loss computed over the batch.
+        """
+        losses = []
+        
+        for game in game_histories:
+            if len(game) == 0:
+                continue
+
+            for move in game:
+                state = move["state"]
+                # Forward pass through the network.
+                # predicted_policy: shape (1, num_actions)
+                # predicted_value: shape (1, 1)
+                predicted_policy, predicted_value = self.forward(state)
+                
+                # Convert target policy distribution to tensor.
+                target_policy = torch.tensor(move["policy_info"],
+                                            dtype=torch.float32,
+                                            device=self.device).unsqueeze(0)
+                # Convert target value to tensor.
+                target_value = torch.tensor([move["target_value"]],
+                                            dtype=torch.float32,
+                                            device=self.device)
+                
+                # Compute the policy loss using cross-entropy-like formulation.
+                # (This is equivalent to -sum(target * log(predicted))).
+                policy_loss = -torch.sum(target_policy * torch.log(predicted_policy + 1e-8))
+                
+                # Compute the value loss using mean-squared error.
+                value_loss = (target_value - predicted_value.squeeze())**2
+                
+                loss = policy_loss + value_loss
+                losses.append(loss)
+        
+        if not losses:
+            print("No move history found! Skipping update.")
+            return 0.0
+
+        total_loss = torch.stack(losses).mean()
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
+
+        print(f"REINFORCE loss: {total_loss.item():.4f}")
+        return total_loss.item()

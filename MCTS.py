@@ -52,9 +52,11 @@ class MCTSNode:
         move = random.choice(unexpanded_moves)
         new_board = self.board.copy()
         new_board.push(move)
-        child_node = MCTSNode(new_board, self.network, parent=self, move=move)
+        # Pass self.action_space here.
+        child_node = MCTSNode(new_board, self.network, self.action_space, parent=self, move=move)
         self.children[move] = child_node
         return child_node
+
 
     def backup(self, value):
         """Backpropagates the evaluation value up the tree."""
@@ -86,5 +88,12 @@ def mcts_search(board, network, action_space, num_simulations=100):
             value = value_tensor.item()
         node.backup(value)
     
+    # Compute policy info as normalized visit counts.
+    total_visits = sum(child.visits for child in root.children.values())
+    policy_info = np.zeros(len(action_space))
+    for move, child in root.children.items():
+        index = action_space.index(move)
+        policy_info[index] = child.visits / total_visits if total_visits > 0 else 0
+
     best_move = max(root.children.items(), key=lambda item: item[1].visits)[0]
-    return best_move
+    return best_move, policy_info

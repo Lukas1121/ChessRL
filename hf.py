@@ -2,7 +2,7 @@
 
 import os
 import chess
-from ChessRL_test import ChessPolicyNet
+from ChessRL_test import ChessPolicyNet,ChessHybridNet
 import random
 import os
 import numpy as np
@@ -72,24 +72,24 @@ def separate_and_evaluate_game_histories(game_histories, results, terminal_rewar
         
         # Adjust final move rewards with terminal reward.
         result = results[game_index]
+        penalty = per_move_penalty * len(game)/2
         if result == "1-0":
             if white_moves:
-                white_moves[-1]['reward'] += terminal_reward
+                white_moves[-1]['reward'] += terminal_reward + penalty
             if black_moves:
-                black_moves[-1]['reward'] -= terminal_reward
+                black_moves[-1]['reward'] -= terminal_reward + penalty
             white_final = terminal_reward
             black_final = -terminal_reward
         elif result == "0-1":
             if white_moves:
-                white_moves[-1]['reward'] -= terminal_reward
+                white_moves[-1]['reward'] -= terminal_reward + penalty
             if black_moves:
-                black_moves[-1]['reward'] += terminal_reward
+                black_moves[-1]['reward'] += terminal_reward + penalty
             white_final = -terminal_reward
             black_final = terminal_reward
         else:  # Draw ("1/2-1/2")
-            draw_penalty = -per_move_penalty * len(game)
-            white_final = draw_penalty
-            black_final = draw_penalty
+            white_final = penalty
+            black_final = penalty
 
         white_game_histories.append(white_moves)
         black_game_histories.append(black_moves)
@@ -102,8 +102,7 @@ def separate_and_evaluate_game_histories(game_histories, results, terminal_rewar
     return white_game_histories, black_game_histories, white_avg_points, black_avg_points
 
 
-
-def generate_self_play_samples(agent_white, agent_black, config):
+def generate_self_play_samples(agent_white, agent_black, game_length, config):
     """
     Plays one self-play game and returns a list of training samples.
     
@@ -116,6 +115,8 @@ def generate_self_play_samples(agent_white, agent_black, config):
     board = chess.Board()
 
     while not board.is_game_over():
+        if len(samples) >= 2*game_length:
+            break
         # Check move history or other stopping conditions if needed.
         if board.turn == chess.WHITE:
             agent = agent_white
@@ -146,11 +147,13 @@ def generate_self_play_samples(agent_white, agent_black, config):
 def train_chess_networks_RL(
     num_iterations=400,
     games_per_iteration=5,
+    game_length = 120,
     epsilon_initial=0.3,
     epsilon_final=0.1,
     lr=0.0004,
     gamma=0.95,
-    per_move_penalty=1,
+    per_move_penalty=-1,
+    layers=10,
     terminal_reward = 200,
     pretrained_model_path_white=None,
     pretrained_model_path_black=None,
@@ -161,12 +164,14 @@ def train_chess_networks_RL(
         board=chess.Board(),
         color=chess.WHITE,
         device=device,
+        layers=layers,
         epsilon=epsilon_initial
     ).to(device)
     agent_black = ChessPolicyNet(
         board=chess.Board(),
         color=chess.BLACK,
         device=device,
+        layers=layers,
         epsilon=epsilon_initial
     ).to(device)
     
@@ -208,7 +213,7 @@ def train_chess_networks_RL(
 
         for _ in range(games_per_iteration):
             # Generate one self-play game.
-            samples, result = generate_self_play_samples(agent_white, agent_black, config)
+            samples, result = generate_self_play_samples(agent_white, agent_black, game_length, config)
             game_lengths.append(len(samples))
             results.append(result)
             print(results[-1])
@@ -218,8 +223,8 @@ def train_chess_networks_RL(
 
         white_game_histories, black_game_histories, white_avg_points, black_avg_points = separate_and_evaluate_game_histories(game_histories, results, terminal_reward, per_move_penalty, agent_white, agent_black)
 
-        white_loss = agent_white.reinforce_update(optimizer_white, white_game_histories, gamma=gamma)
-        black_loss = agent_black.reinforce_update(optimizer_black, black_game_histories, gamma=gamma)
+        white_loss = agent_white.reinforce_update(optimizer_white, white_game_histories,gamma=gamma)
+        black_loss = agent_black.reinforce_update(optimizer_black, black_game_histories,gamma=gamma)
 
         # Compute win/draw statistics.
         white_wins = results.count("1-0")
@@ -235,9 +240,19 @@ def train_chess_networks_RL(
         metrics["white_avg_points"].append(white_avg_points)
         metrics["black_avg_points"].append(black_avg_points)
 
-        # For now, we'll just record loss and win rates.
-        print(f"Iteration {iteration+1} completed: Avg Length {np.mean(game_lengths):.2f}, White Loss {white_loss:.4f}, Black Loss {black_loss:.4f}")
+        # Log the progress.
+        print(f"Iteration {iteration+1} completed: Avg Length {np.mean(game_lengths)/2:.2f}, "
+              f"White win rate {white_wins / total_games:.2f}, Black win rate {black_wins / total_games:.2f}, "
+              f"Draw rate {draws / total_games:.2f}")
 
+        # Save checkpoint every 100 iterations.
+        if (iteration + 1) % 400 == 0:
+            print(f"Saving checkpoint at iteration {iteration+1}...")
+            save_models_and_metrics(
+                policy_net_white=agent_white,
+                policy_net_black=agent_black,
+                metrics=metrics
+            )
     # Optionally, save your metrics to disk.
     save_models_and_metrics(policy_net_white=agent_white, policy_net_black=agent_black, metrics=metrics)
 
@@ -364,3 +379,120 @@ def plot_training_metrics_binned(metrics, num_bins=20):
 
     plt.tight_layout()
     return fig
+
+def train_chess_networks_hybrid(
+    num_iterations=400,
+    games_per_iteration=5,
+    game_length=120,
+    epsilon_initial=0.3,
+    epsilon_final=0.1,
+    lr=0.0004,
+    gamma=0.95,
+    per_move_penalty=-1,
+    layers=2,  # Default to 2 layers as described in the hybrid network docstring.
+    terminal_reward=200,
+    pretrained_model_path_white=None,
+    pretrained_model_path_black=None,
+    config=None  # Should include any necessary parameters such as config.move_kwargs
+):
+    # Initialize agents using the hybrid network.
+    agent_white = ChessHybridNet(
+        board=chess.Board(),
+        color=chess.WHITE,
+        device=device,
+        layers=layers
+    ).to(device)
+    agent_black = ChessHybridNet(
+        board=chess.Board(),
+        color=chess.BLACK,
+        device=device,
+        layers=layers
+    ).to(device)
+    
+    # Load pretrained weights if provided.
+    if pretrained_model_path_white:
+        agent_white.load_state_dict(torch.load(pretrained_model_path_white, map_location=device))
+    if pretrained_model_path_black:
+        agent_black.load_state_dict(torch.load(pretrained_model_path_black, map_location=device))
+    
+    agent_white.train()
+    agent_black.train()
+
+    optimizer_white = torch.optim.Adam(agent_white.parameters(), lr=lr)
+    optimizer_black = torch.optim.Adam(agent_black.parameters(), lr=lr)
+
+    # Metrics dictionary to track progress.
+    metrics = {
+        "white_loss_list": [],
+        "black_loss_list": [],
+        "white_avg_points": [],
+        "black_avg_points": [],
+        "game_length_list": [],
+        "white_win_rates": [],
+        "black_win_rates": [],
+        "draw_rates": []
+    }
+
+    for iteration in range(num_iterations):
+        # Decay epsilon over time (if your hybrid agent uses it in choose_move for any exploration).
+        epsilon = max(epsilon_final, epsilon_initial - (epsilon_initial - epsilon_final) * (iteration / num_iterations))
+        agent_white.epsilon = epsilon
+        agent_black.epsilon = epsilon
+
+        print(f"Iteration {iteration+1}/{num_iterations} with epsilon = {epsilon:.4f}")
+
+        game_histories = []
+        game_lengths = []
+        results = []
+
+        for _ in range(games_per_iteration):
+            # Generate one self-play game.
+            samples, result = generate_self_play_samples(agent_white, agent_black, game_length, config)
+            game_lengths.append(len(samples))
+            results.append(result)
+            print(f"Game result: {result}")
+            
+            # (Optionally, you could split samples based on turn or agent.)
+            game_histories.append(samples)
+
+        # Evaluate and separate game histories.
+        white_game_histories, black_game_histories, white_avg_points, black_avg_points = separate_and_evaluate_game_histories(
+            game_histories, results, terminal_reward, per_move_penalty, agent_white, agent_black
+        )
+
+        # Perform policy updates using the agents’ reinforcement learning update routines.
+        white_loss = agent_white.reinforce_update(optimizer_white, white_game_histories)
+        black_loss = agent_black.reinforce_update(optimizer_black, black_game_histories)
+
+        # Compute win/draw statistics.
+        white_wins = results.count("1-0")
+        black_wins = results.count("0-1")
+        draws = results.count("1/2-1/2")
+        total_games = len(results)
+        metrics["white_win_rates"].append(white_wins / total_games)
+        metrics["black_win_rates"].append(black_wins / total_games)
+        metrics["draw_rates"].append(draws / total_games)
+        metrics["game_length_list"].append(np.mean(game_lengths))
+        metrics["white_loss_list"].append(white_loss)
+        metrics["black_loss_list"].append(black_loss)
+        metrics["white_avg_points"].append(white_avg_points)
+        metrics["black_avg_points"].append(black_avg_points)
+
+        # Log the progress.
+        print(f"Iteration {iteration+1} completed: Avg Length {np.mean(game_lengths):.2f}, "
+              f"White win rate {white_wins / total_games:.4f}, Black win rate {black_wins / total_games:.4f}, "
+              f"Draw rate {draws / total_games:.4f}")
+
+        # Save checkpoint every 100 iterations.
+        if (iteration + 1) % 100 == 0:
+            print(f"Saving checkpoint at iteration {iteration+1}...")
+            save_models_and_metrics(
+                policy_net_white=agent_white,
+                policy_net_black=agent_black,
+                metrics=metrics
+            )
+
+    # Optionally, save your final metrics to disk.
+    save_models_and_metrics(policy_net_white=agent_white, policy_net_black=agent_black, metrics=metrics)
+
+    return metrics
