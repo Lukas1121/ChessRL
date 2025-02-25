@@ -11,3 +11,5 @@
 !notes.txt
 !hf.py
 !ChessRL_test.py
+!legacy/
+!legacy/**
