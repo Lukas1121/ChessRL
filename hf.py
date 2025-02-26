@@ -2,7 +2,7 @@
 
 import os
 import chess
-from ChessRL_test import ChessPolicyNet,ChessHybridNet
+from ChessRL import ChessPolicyNet,ChessHybridNet
 import random
 import os
 import numpy as np
@@ -15,7 +15,7 @@ else:
     print("GPU not available, using CPU instead.")
 import matplotlib.pyplot as plt
 
-def separate_and_evaluate_game_histories(game_histories, results, terminal_reward, per_move_penalty, agent_white, agent_black):
+def separate_and_evaluate_game_histories(game_histories, results, terminal_reward, per_move_penalty, max_game_length, exceed_penalty, agent_white, agent_black):
     """
     Given a list of game histories (each a list of move sample dicts), the game results,
     and a terminal reward, compute the reward for each move and separate the moves into
@@ -63,33 +63,43 @@ def separate_and_evaluate_game_histories(game_histories, results, terminal_rewar
         for i, sample in enumerate(game):
             if i % 2 == 0:  # White's move.
                 reward = torch.sum(sample['state'] * white_value_tensor).item()
-                sample['reward'] = reward
+                # Subtract the per-move penalty
+                sample['reward'] = reward + per_move_penalty  
                 white_moves.append(sample)
             else:           # Black's move.
                 reward = -torch.sum(sample['state'] * black_value_tensor).item()
-                sample['reward'] = reward
+                # Subtract the per-move penalty (or add if your convention requires)
+                sample['reward'] = reward + per_move_penalty  
                 black_moves.append(sample)
         
         # Adjust final move rewards with terminal reward.
         result = results[game_index]
-        penalty = per_move_penalty * len(game)/2
         if result == "1-0":
             if white_moves:
-                white_moves[-1]['reward'] += terminal_reward + penalty
+                white_moves[-1]['reward'] += terminal_reward
             if black_moves:
-                black_moves[-1]['reward'] -= terminal_reward + penalty
+                black_moves[-1]['reward'] -= terminal_reward
             white_final = terminal_reward
             black_final = -terminal_reward
         elif result == "0-1":
             if white_moves:
-                white_moves[-1]['reward'] -= terminal_reward + penalty
+                white_moves[-1]['reward'] -= terminal_reward
             if black_moves:
-                black_moves[-1]['reward'] += terminal_reward + penalty
+                black_moves[-1]['reward'] += terminal_reward
             white_final = -terminal_reward
             black_final = terminal_reward
         else:  # Draw ("1/2-1/2")
+            penalty = per_move_penalty * len(game)/2
             white_final = penalty
             black_final = penalty
+
+        if len(game) >= max_game_length:
+            if white_moves:
+                white_moves[-1]['reward'] += exceed_penalty
+            if black_moves:
+                black_moves[-1]['reward'] += exceed_penalty
+            white_final += exceed_penalty
+            black_final += exceed_penalty
 
         white_game_histories.append(white_moves)
         black_game_histories.append(black_moves)
@@ -153,6 +163,7 @@ def train_chess_networks_RL(
     lr=0.0004,
     gamma=0.95,
     per_move_penalty=-1,
+    exceed_penalty=-50,
     layers=10,
     terminal_reward = 200,
     pretrained_model_path_white=None,
@@ -221,8 +232,18 @@ def train_chess_networks_RL(
             # (Optionally, you could split samples based on turn or agent.)
             game_histories.append(samples)
 
-        white_game_histories, black_game_histories, white_avg_points, black_avg_points = separate_and_evaluate_game_histories(game_histories, results, terminal_reward, per_move_penalty, agent_white, agent_black)
-
+        (white_game_histories, 
+         black_game_histories, 
+         white_avg_points, 
+         black_avg_points) = separate_and_evaluate_game_histories(game_histories, 
+                                                                  results, 
+                                                                  terminal_reward, 
+                                                                  per_move_penalty, 
+                                                                  agent_white, 
+                                                                  agent_black, 
+                                                                  game_length, 
+                                                                  exceed_penalty)
+        
         white_loss = agent_white.reinforce_update(optimizer_white, white_game_histories,gamma=gamma)
         black_loss = agent_black.reinforce_update(optimizer_black, black_game_histories,gamma=gamma)
 
@@ -246,7 +267,7 @@ def train_chess_networks_RL(
               f"Draw rate {draws / total_games:.2f}")
 
         # Save checkpoint every 100 iterations.
-        if (iteration + 1) % 400 == 0:
+        if (iteration + 1) % 1000 == 0:
             print(f"Saving checkpoint at iteration {iteration+1}...")
             save_models_and_metrics(
                 policy_net_white=agent_white,
