@@ -15,7 +15,8 @@ else:
     print("GPU not available, using CPU instead.")
 import matplotlib.pyplot as plt
 
-def separate_and_evaluate_game_histories(game_histories, results, terminal_reward, per_move_penalty, max_game_length, exceed_penalty, agent_white, agent_black):
+def separate_and_evaluate_game_histories(agent_white, agent_black, game_histories, results, terminal_reward, per_move_penalty,
+                                           max_game_length, exceed_penalty, non_capture_penalty=0, repeat_flip_penalty=0):
     """
     Given a list of game histories (each a list of move sample dicts), the game results,
     and a terminal reward, compute the reward for each move and separate the moves into
@@ -24,6 +25,9 @@ def separate_and_evaluate_game_histories(game_histories, results, terminal_rewar
     Each move sample is expected to contain:
       - 'state': a torch.Tensor of shape [12, 8, 8]
       - 'policy_info': the output from move selection (e.g. log_prob)
+      - 'move': (optional) a chess.Move object representing the move
+      - 'board': (optional) the chess.Board object from which the move was made,
+          OR an 'is_capture' boolean flag can be provided.
     
     For each move, an intermediate reward is computed as:
          reward = sum(state * value_tensor)
@@ -42,6 +46,11 @@ def separate_and_evaluate_game_histories(game_histories, results, terminal_rewar
       - Black win ("0-1"): white = -terminal_reward, black = terminal_reward.
       - Draw ("1/2-1/2"): white = 0, black = 0.
     
+    New Parameters:
+      - non_capture_penalty: extra penalty subtracted if the move is not a capture.
+      - repeat_flip_penalty: extra penalty subtracted if the current move is exactly the reverse of
+                             the immediately previous move.
+    
     Returns:
       - white_game_histories: List of game histories (one per game) for white moves.
       - black_game_histories: List of game histories (one per game) for black moves.
@@ -56,23 +65,50 @@ def separate_and_evaluate_game_histories(game_histories, results, terminal_rewar
     white_final_scores = []
     black_final_scores = []
     
+    # Process each game.
     for game_index, game in enumerate(game_histories):
         white_moves = []
         black_moves = []
-        # Compute intermediate rewards for each move.
+        
+        # Process each move sample in the game.
         for i, sample in enumerate(game):
+            move = sample.get('move', None)
+            # Determine if the move is a capture.
+            is_capture = False
+            if move is not None:
+                if 'board' in sample:
+                    is_capture = sample['board'].is_capture(move)
+                else:
+                    is_capture = sample.get('is_capture', False)
+            
+            # Compute the intermediate reward.
             if i % 2 == 0:  # White's move.
                 reward = torch.sum(sample['state'] * white_value_tensor).item()
-                # Subtract the per-move penalty
-                sample['reward'] = reward + per_move_penalty  
+                sample['reward'] = reward + per_move_penalty
+                if not is_capture:
+                    sample['reward'] = non_capture_penalty
+                # Check if the current move reverses the immediate previous move.
+                if i > 0:
+                    prev_move = game[i-1].get('move', None)
+                    if prev_move is not None and move is not None:
+                        reverse_prev = type(prev_move)(prev_move.to_square, prev_move.from_square)
+                        if move == reverse_prev:
+                            sample['reward'] = repeat_flip_penalty
                 white_moves.append(sample)
-            else:           # Black's move.
+            else:  # Black's move.
                 reward = -torch.sum(sample['state'] * black_value_tensor).item()
-                # Subtract the per-move penalty (or add if your convention requires)
-                sample['reward'] = reward + per_move_penalty  
+                sample['reward'] = reward + per_move_penalty
+                if not is_capture:
+                    sample['reward'] = non_capture_penalty
+                if i > 0:
+                    prev_move = game[i-1].get('move', None)
+                    if prev_move is not None and move is not None:
+                        reverse_prev = type(prev_move)(prev_move.to_square, prev_move.from_square)
+                        if move == reverse_prev:
+                            sample['reward'] = repeat_flip_penalty
                 black_moves.append(sample)
         
-        # Adjust final move rewards with terminal reward.
+        # Adjust final move rewards based on the game result.
         result = results[game_index]
         if result == "1-0":
             if white_moves:
@@ -89,10 +125,11 @@ def separate_and_evaluate_game_histories(game_histories, results, terminal_rewar
             white_final = -terminal_reward
             black_final = terminal_reward
         else:  # Draw ("1/2-1/2")
-            penalty = per_move_penalty * len(game)/2
+            penalty = per_move_penalty * (len(game) / 2)
             white_final = penalty
             black_final = penalty
 
+        # Apply penalty if game length exceeds maximum.
         if len(game) >= max_game_length:
             if white_moves:
                 white_moves[-1]['reward'] += exceed_penalty
@@ -141,6 +178,7 @@ def generate_self_play_samples(agent_white, agent_black, game_length, config):
         sample = {
             "state": agent.board_tensor.clone(),
             "policy_info": policy_info,
+            "move" : move
         }
         samples.append(sample)
         
@@ -162,6 +200,8 @@ def train_chess_networks_RL(
     epsilon_final=0.1,
     lr=0.0004,
     gamma=0.95,
+    non_capture_penalty=0, 
+    repeat_flip_penalty=0,
     per_move_penalty=-1,
     exceed_penalty=-50,
     layers=10,
@@ -235,14 +275,8 @@ def train_chess_networks_RL(
         (white_game_histories, 
          black_game_histories, 
          white_avg_points, 
-         black_avg_points) = separate_and_evaluate_game_histories(game_histories, 
-                                                                  results, 
-                                                                  terminal_reward, 
-                                                                  per_move_penalty, 
-                                                                  agent_white, 
-                                                                  agent_black, 
-                                                                  game_length, 
-                                                                  exceed_penalty)
+         black_avg_points) = separate_and_evaluate_game_histories(agent_white, agent_black, game_histories, results, terminal_reward, per_move_penalty,
+                                           game_length, exceed_penalty, non_capture_penalty, repeat_flip_penalty)
         
         white_loss = agent_white.reinforce_update(optimizer_white, white_game_histories,gamma=gamma)
         black_loss = agent_black.reinforce_update(optimizer_black, black_game_histories,gamma=gamma)
