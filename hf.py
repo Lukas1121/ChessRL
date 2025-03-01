@@ -114,20 +114,16 @@ def separate_and_evaluate_game_histories(agent_white, agent_black, game_historie
             if white_moves:
                 white_moves[-1]['reward'] += terminal_reward
             if black_moves:
-                black_moves[-1]['reward'] -= terminal_reward
-            white_final = terminal_reward
-            black_final = -terminal_reward
+                black_moves[-1]['reward'] -= terminal_reward/5
         elif result == "0-1":
             if white_moves:
-                white_moves[-1]['reward'] -= terminal_reward
+                white_moves[-1]['reward'] -= terminal_reward/5
             if black_moves:
                 black_moves[-1]['reward'] += terminal_reward
-            white_final = -terminal_reward
-            black_final = terminal_reward
         else:  # Draw ("1/2-1/2")
             penalty = per_move_penalty * (len(game) / 2)
-            white_final = penalty
-            black_final = penalty
+            white_moves[-1]['reward'] += penalty
+            black_moves[-1]['reward'] += penalty
 
         # Apply penalty if game length exceeds maximum.
         if len(game) >= max_game_length:
@@ -135,13 +131,11 @@ def separate_and_evaluate_game_histories(agent_white, agent_black, game_historie
                 white_moves[-1]['reward'] += exceed_penalty
             if black_moves:
                 black_moves[-1]['reward'] += exceed_penalty
-            white_final += exceed_penalty
-            black_final += exceed_penalty
 
         white_game_histories.append(white_moves)
         black_game_histories.append(black_moves)
-        white_final_scores.append(white_final)
-        black_final_scores.append(black_final)
+        white_final_scores.append(white_moves[-1]['reward'])
+        black_final_scores.append(black_moves[-1]['reward'])
     
     white_avg_points = np.mean(white_final_scores) if white_final_scores else 0
     black_avg_points = np.mean(black_final_scores) if black_final_scores else 0
@@ -438,14 +432,17 @@ def plot_training_metrics_binned(metrics, num_bins=20):
 def train_chess_networks_hybrid(
     num_iterations=400,
     games_per_iteration=5,
-    game_length=120,
+    game_length = 120,
     epsilon_initial=0.3,
     epsilon_final=0.1,
     lr=0.0004,
-    gamma=0.95,
+    non_capture_penalty=0, 
+    repeat_flip_penalty=0,
     per_move_penalty=-1,
-    layers=2,  # Default to 2 layers as described in the hybrid network docstring.
-    terminal_reward=200,
+    exceed_penalty=-50,
+    layers=10,
+    terminal_reward = 200,
+    simulations = 10,
     pretrained_model_path_white=None,
     pretrained_model_path_black=None,
     config=None  # Should include any necessary parameters such as config.move_kwargs
@@ -510,10 +507,11 @@ def train_chess_networks_hybrid(
             # (Optionally, you could split samples based on turn or agent.)
             game_histories.append(samples)
 
-        # Evaluate and separate game histories.
-        white_game_histories, black_game_histories, white_avg_points, black_avg_points = separate_and_evaluate_game_histories(
-            game_histories, results, terminal_reward, per_move_penalty, agent_white, agent_black
-        )
+        (white_game_histories, 
+         black_game_histories, 
+         white_avg_points, 
+         black_avg_points) = separate_and_evaluate_game_histories(agent_white, agent_black, game_histories, results, terminal_reward, per_move_penalty,
+                                           game_length, exceed_penalty, non_capture_penalty, repeat_flip_penalty)
 
         # Perform policy updates using the agents’ reinforcement learning update routines.
         white_loss = agent_white.reinforce_update(optimizer_white, white_game_histories)
@@ -551,3 +549,137 @@ def train_chess_networks_hybrid(
     save_models_and_metrics(policy_net_white=agent_white, policy_net_black=agent_black, metrics=metrics)
 
     return metrics
+
+def play_human_vs_bot(white_model_path, black_model_path, human_color=None):
+    """
+    Play a game of chess between a human and the bot.
+    
+    Parameters:
+        white_model_path (str): Path to the pretrained model file for White.
+        black_model_path (str): Path to the pretrained model file for Black.
+        human_color (chess.WHITE or chess.BLACK or None): The color you wish to play.
+            If set to None, the bot's color is chosen at random, and you play the opposite.
+        method (str): The method for move selection ('rl', 'mcts', 'lookahead').
+        minmax_depth (int): The depth to search when using minimax.
+        top_n (int): Number of candidate moves to evaluate in minimax.
+        simulations (int): Number of simulations for MCTS.
+    
+    Behavior:
+        - If human_color is provided, the bot plays the opposite color.
+        - If human_color is None, a random color is chosen for the bot.
+    
+    Assumes:
+        - A function `print_custom_board(board)` exists for displaying the board.
+        - The classes `ChessRL` and `ChessPolicyNet` have been defined and imported.
+    
+    Returns:
+        None
+    """
+    board = chess.Board()
+    
+    # Determine colors.
+    if human_color is None:
+        bot_color = random.choice([chess.WHITE, chess.BLACK])
+        human_color = not bot_color
+    else:
+        bot_color = not human_color
+
+    print("Bot plays as:", "White" if bot_color == chess.WHITE else "Black")
+    print("You play as:", "White" if human_color == chess.WHITE else "Black")
+    print()
+
+    # Create the policy network for the bot and load the appropriate model.
+    if bot_color == chess.WHITE:
+        policy_net = ChessPolicyNet(
+            board=board,
+            device=device,
+            color=chess.WHITE
+        ).to(device)
+        policy_net.load_state_dict(torch.load(white_model_path, map_location=device))
+    else:
+        policy_net = ChessPolicyNet(
+            board=board,
+            device=device,
+            color=chess.BLACK
+        ).to(device)
+        policy_net.load_state_dict(torch.load(black_model_path, map_location=device))
+    
+    # Set the model to evaluation mode.
+    policy_net.eval()
+
+    # Game loop.
+    while not board.is_game_over():
+        # Display the current board.
+        print_custom_board(board)
+        
+        if board.turn == bot_color:
+            # Bot's turn.
+            policy_net.update_board(board)
+            move, _ = policy_net.choose_move()
+            
+            if move not in board.legal_moves:
+                print("Selected move is illegal! (Something is wrong with masking.)")
+                continue
+            
+            print("Bot plays:", move)
+            board.push(move)
+        else:
+            # Human's turn.
+            move_str = input("Your move (in UCI format, e.g., e2e4): ").strip()
+            try:
+                move = chess.Move.from_uci(move_str)
+            except ValueError:
+                print("Invalid move format. Please try again.\n")
+                continue
+            
+            if move in board.legal_moves:
+                board.push(move)
+            else:
+                print("Illegal move. Please try again.\n")
+                continue
+        
+        print()  # Blank line for readability.
+    
+    # Final board display and result.
+    print_custom_board(board)
+    print("Game over!")
+    print("Result:", board.result())
+
+def print_custom_board(board):
+    """
+    Prints the chess board with a fixed-width for each square.
+    Each piece is shown with a preceding 'white ' for white pieces and 'black ' for black pieces,
+    centered in an 8-character wide field.
+    Empty squares are shown as '.'.
+    The board is printed from rank 8 to 1.
+    """
+    cell_width = 8  # Increase the width to accommodate "white " or "black " + piece symbol
+
+    # Loop over the ranks from 8 down to 1.
+    for rank in range(7, -1, -1):
+        # Create the row starting with the rank number and two spaces.
+        row_str = f"{rank+1}  "
+        for file in range(8):
+            sq = chess.square(file, rank)
+            piece = board.piece_at(sq)
+            if piece is None:
+                cell_str = "."
+            else:
+                # Prepend with 'white ' or 'black ' and append the piece symbol (upper-case)
+                if piece.color == chess.WHITE:
+                    cell_str = f"white {piece.symbol().upper()}"
+                else:
+                    cell_str = f"black {piece.symbol().upper()}"
+            # Center the cell string in a field of width cell_width
+            row_str += f"{cell_str:^{cell_width}}"
+        print(row_str)
+
+    # Compute the left margin based on the rank label (e.g. "8  " is 3 characters).
+    label_width = len(f"{8}  ")
+    file_str = " " * label_width
+    for file in range(8):
+        file_letter = chr(ord('a') + file)
+        file_str += f"{file_letter:^{cell_width}}"
+    print(file_str)
+    print()
+

@@ -367,14 +367,20 @@ class ChessHybridNet(nn.Module, ChessRL):
         return best_move, policy_info
 
     def forward(self, board_tensor):
-        # Input: board_tensor with shape (12, 8, 8).
-        x = board_tensor.to(self.device).unsqueeze(0)  # Now shape: (1, 12, 8, 8)
-        x = self.conv_layers(x)                       # Process through conv layers.
-        x = x.view(x.size(0), -1)                       # Flatten to shape: (1, 64*8*8)
+        # If the input is unbatched (shape: [12, 8, 8]), add a batch dimension.
+        if board_tensor.ndim == 3:
+            x = board_tensor.to(self.device).unsqueeze(0)  # Now shape: (1, 12, 8, 8)
+        else:
+            # Assume the input is already batched (shape: [N, 12, 8, 8]).
+            x = board_tensor.to(self.device)
+        
+        x = self.conv_layers(x)        # Process through conv layers.
+        x = x.view(x.size(0), -1)        # Flatten: shape becomes (N, 64*8*8)
         x = F.relu(self.fc1(x))
         policy_logits = self.policy_head(x)
-        value = torch.tanh(self.value_head(x))          # Value in range [-1,1]
+        value = torch.tanh(self.value_head(x))  # Value in range [-1,1]
         return F.softmax(policy_logits, dim=-1), value
+
 
     def reinforce_update(self, optimizer, game_histories):
         """
@@ -385,7 +391,7 @@ class ChessHybridNet(nn.Module, ChessRL):
         - "target_value": the final outcome from the perspective of the moving agent.
         
         Returns:
-            The average loss computed over the batch.
+        The average loss computed over the batch.
         """
         losses = []
         
@@ -394,27 +400,26 @@ class ChessHybridNet(nn.Module, ChessRL):
                 continue
 
             for move in game:
-                state = move["state"]
-                # Forward pass through the network.
-                # predicted_policy: shape (1, num_actions)
-                # predicted_value: shape (1, 1)
+                state = move["state"]  # Assume shape [12, 8, 8]
+                # Forward pass: expected output shapes: 
+                # predicted_policy: (1, num_actions) and predicted_value: (1, 1)
                 predicted_policy, predicted_value = self.forward(state)
                 
-                # Convert target policy distribution to tensor.
+                # Convert target policy distribution to tensor (shape: (1, num_actions)).
                 target_policy = torch.tensor(move["policy_info"],
                                             dtype=torch.float32,
                                             device=self.device).unsqueeze(0)
-                # Convert target value to tensor.
+                
+                # Convert target value to tensor (shape: (1,)).
                 target_value = torch.tensor([move["target_value"]],
                                             dtype=torch.float32,
                                             device=self.device)
                 
-                # Compute the policy loss using cross-entropy-like formulation.
-                # (This is equivalent to -sum(target * log(predicted))).
+                # Policy loss: equivalent to -sum(target_policy * log(predicted_policy)).
                 policy_loss = -torch.sum(target_policy * torch.log(predicted_policy + 1e-8))
                 
-                # Compute the value loss using mean-squared error.
-                value_loss = (target_value - predicted_value.squeeze())**2
+                # Value loss: squared error between predicted value and target value.
+                value_loss = (target_value - predicted_value.squeeze()) ** 2
                 
                 loss = policy_loss + value_loss
                 losses.append(loss)
