@@ -2,11 +2,15 @@
 
 import os
 import chess
+import chess.pgn
 from ChessRL import ChessPolicyNet,ChessHybridNet
 import random
 import os
+import glob
 import numpy as np
+from itertools import cycle
 import torch
+import torch.nn.functional as F
 if torch.cuda.is_available():
     device = torch.device("cuda")  # Use the first available GPU
     print("GPU is available and being used.")
@@ -84,7 +88,7 @@ def separate_and_evaluate_game_histories(agent_white, agent_black, game_historie
             # Compute the intermediate reward.
             if i % 2 == 0:  # White's move.
                 reward = torch.sum(sample['state'] * white_value_tensor).item()
-                sample['reward'] = reward + per_move_penalty
+                sample['reward'] = reward
                 if not is_capture:
                     sample['reward'] = non_capture_penalty
                 # Check if the current move reverses the immediate previous move.
@@ -97,7 +101,7 @@ def separate_and_evaluate_game_histories(agent_white, agent_black, game_historie
                 white_moves.append(sample)
             else:  # Black's move.
                 reward = -torch.sum(sample['state'] * black_value_tensor).item()
-                sample['reward'] = reward + per_move_penalty
+                sample['reward'] = reward
                 if not is_capture:
                     sample['reward'] = non_capture_penalty
                 if i > 0:
@@ -114,10 +118,10 @@ def separate_and_evaluate_game_histories(agent_white, agent_black, game_historie
             if white_moves:
                 white_moves[-1]['reward'] += terminal_reward
             if black_moves:
-                black_moves[-1]['reward'] -= terminal_reward/5
+                black_moves[-1]['reward'] -= terminal_reward/2
         elif result == "0-1":
             if white_moves:
-                white_moves[-1]['reward'] -= terminal_reward/5
+                white_moves[-1]['reward'] -= terminal_reward/2
             if black_moves:
                 black_moves[-1]['reward'] += terminal_reward
         else:  # Draw ("1/2-1/2")
@@ -307,16 +311,16 @@ def train_chess_networks_RL(
 
     return metrics
 
-def get_next_run_directory(base_dir="."):
+def get_next_run_directory(base_dir=".", folder_name="run"):
     """Find the next available run directory (run1, run2, ...)."""
     run_number = 1
-    while os.path.exists(os.path.join(base_dir, f"run{run_number}")):
+    while os.path.exists(os.path.join(base_dir, f"{folder_name}{run_number}")):
         run_number += 1
-    return os.path.join(base_dir, f"run{run_number}")
+    return os.path.join(base_dir, f"{folder_name}{run_number}")
 
-def save_models_and_metrics(policy_net_white, policy_net_black, metrics, base_dir=".", save_to_drive=False):
+def save_models_and_metrics(policy_net_white, policy_net_black, metrics, base_dir=".", save_to_drive=False, folder_name="run"):
     """Save models and a training metrics plot in an incrementing run directory."""
-    save_dir = get_next_run_directory(base_dir)
+    save_dir = get_next_run_directory(base_dir, folder_name)
     if save_to_drive:
         save_dir = os.path.join('/content/drive/MyDrive/ML_States', save_dir)
     os.makedirs(save_dir, exist_ok=True)
@@ -326,12 +330,14 @@ def save_models_and_metrics(policy_net_white, policy_net_black, metrics, base_di
     torch.save(policy_net_black.state_dict(), os.path.join(save_dir, "policy_net_black.pth"))
     print(f"Models saved in {save_dir}")
     
-    # Plot the metrics and save the plot.
-    fig = plot_training_metrics_binned(metrics)
-    plot_path = os.path.join(save_dir, "training_metrics.png")
-    fig.savefig(plot_path)
-    plt.close(fig)  # Close the figure to free up memory
-    print(f"Training metrics plot saved in {plot_path}")
+    if metrics is not None:
+        fig = plot_training_metrics_binned(metrics)
+        plot_path = os.path.join(save_dir, "training_metrics.png")
+        fig.savefig(plot_path)
+        plt.close(fig)  # Close the figure to free up memory
+        print(f"Training metrics plot saved in {plot_path}")
+    else:
+        print(f'model saved to {plot_path}')
 
 def bin_data(data, num_bins):
     """
@@ -550,6 +556,28 @@ def train_chess_networks_hybrid(
 
     return metrics
 
+def count_conv_layers(model_path: str) -> int:
+    """
+    Counts the number of convolutional layers in a PyTorch .pth file by inspecting the state dictionary.
+    
+    This function assumes that the keys for the convolutional layers in the state dictionary
+    contain the substring 'conv_layers' and that each convolutional layer has a weight parameter
+    (e.g., 'conv_layers.0.weight').
+    
+    Parameters:
+        model_path (str): Path to the .pth checkpoint file.
+        
+    Returns:
+        int: The number of convolutional layers found in the checkpoint.
+    """
+    state_dict = torch.load(model_path, map_location=device)
+    # Count keys corresponding to convolutional layer weights.
+    conv_layer_weight_keys = [
+        key for key in state_dict.keys() 
+        if key.startswith("conv_layers") and key.endswith("weight")
+    ]
+    return len(conv_layer_weight_keys)
+
 def play_human_vs_bot(white_model_path, black_model_path, human_color=None):
     """
     Play a game of chess between a human and the bot.
@@ -576,6 +604,7 @@ def play_human_vs_bot(white_model_path, black_model_path, human_color=None):
         None
     """
     board = chess.Board()
+    layers = count_conv_layers(white_model_path)
     
     # Determine colors.
     if human_color is None:
@@ -592,6 +621,7 @@ def play_human_vs_bot(white_model_path, black_model_path, human_color=None):
     if bot_color == chess.WHITE:
         policy_net = ChessPolicyNet(
             board=board,
+            layers=layers,
             device=device,
             color=chess.WHITE
         ).to(device)
@@ -599,6 +629,7 @@ def play_human_vs_bot(white_model_path, black_model_path, human_color=None):
     else:
         policy_net = ChessPolicyNet(
             board=board,
+            layers=layers,
             device=device,
             color=chess.BLACK
         ).to(device)
@@ -683,3 +714,142 @@ def print_custom_board(board):
     print(file_str)
     print()
 
+
+def train_chess_network_from_preprocessed(
+   data_dir,                  # Folder containing .pt files
+    total_iterations=100000,   # Total mini-batch updates
+    batch_size=32,
+    lr=0.0001,
+    layers=5,
+    checkpoint_interval=10000, # Save model every this many iterations
+    pretrained_model_path=None,
+    verbose=True
+):
+    """
+    Train a ChessPolicyNet model using preprocessed samples stored in .pt files.
+    
+    Each .pt file in data_dir is expected to contain a list of tuples:
+        (state_tensor, UCI_move, move_index, result)
+    
+    For training, only the (state_tensor, move_index) pair is used.
+    
+    The function loads all .pt files from data_dir in random order, combines the samples,
+    shuffles them, and then uses them in a mini-batch training loop.
+    
+    Parameters:
+      data_dir (str): Folder containing the preprocessed .pt files.
+      total_iterations (int): Total training iterations (mini-batch updates).
+      batch_size (int): Mini-batch size.
+      lr (float): Learning rate.
+      layers (int): Number of convolutional layers for the model.
+      checkpoint_interval (int): Save checkpoint every this many iterations.
+      pretrained_model_path (str or None): Path to a pretrained model (if any).
+      verbose (bool): If True, prints progress messages.
+      
+    Returns:
+      metrics (dict): Training metrics.
+    """
+    # Gather all .pt files in the folder.
+    pt_files = glob.glob(os.path.join(data_dir, "*.pt"))
+    if verbose:
+        print(f"Found {len(pt_files)} .pt files in '{data_dir}'.")
+    # Shuffle file list in random order.
+    random.shuffle(pt_files)
+    
+    # Load and combine all training samples from the files.
+    training_samples = []
+    for pt_file in pt_files:
+        data = torch.load(pt_file)
+        # Each file should contain a list of tuples:
+        # (state_tensor, UCI_move, move_index, result)
+        training_samples.extend(data)
+        if verbose:
+            print(f"Loaded {len(data)} samples from {pt_file}.")
+    
+    if verbose:
+        print(f"Total training samples loaded: {len(training_samples)}.")
+    
+    # For training, extract only the (state_tensor, move_index) pairs.
+    training_samples = [(state, move_idx) for (state, uci_move, move_idx, result) in training_samples]
+    random.shuffle(training_samples)
+    
+    # Initialize the model.
+    model = ChessPolicyNet(
+        board=chess.Board(),
+        color=chess.WHITE,  # Arbitrary in a single-model setup
+        device=device,
+        layers=layers,
+        epsilon=0.0      # No exploration during supervised training.
+    ).to(device)
+    
+    if pretrained_model_path:
+        model.load_state_dict(torch.load(pretrained_model_path, map_location=device))
+        if verbose:
+            print(f"Loaded pretrained weights from {pretrained_model_path}")
+    
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    metrics = {
+        "losses": [],
+        "iterations": 0,
+        "samples_processed": 0
+    }
+    iteration = 0
+    num_samples = len(training_samples)
+    sample_index = 0  # pointer in training_samples
+    
+    def update_on_batch(agent, optimizer, batch_samples):
+        # Stack state tensors into a single tensor of shape (B, 12, 8, 8)
+        states = torch.stack([sample[0] for sample in batch_samples]).to(device)
+        targets = torch.tensor([sample[1] for sample in batch_samples], dtype=torch.long, device=device)
+        optimizer.zero_grad()
+        x = agent.conv_layers(states)
+        x = x.view(x.size(0), -1)
+        x = F.relu(agent.fc1(x))
+        logits = agent.fc2(x)
+        loss = F.cross_entropy(logits, targets)
+        loss.backward()
+        optimizer.step()
+        return loss.item()
+    
+    if verbose:
+        print("Starting training using preprocessed folder data...")
+    
+    # Training loop.
+    while iteration < total_iterations:
+        # If we've reached the end of the samples, reshuffle and restart.
+        if sample_index + batch_size > num_samples:
+            random.shuffle(training_samples)
+            sample_index = 0
+        batch = training_samples[sample_index: sample_index + batch_size]
+        sample_index += batch_size
+        loss = update_on_batch(model, optimizer, batch)
+        iteration += 1
+        metrics["losses"].append(loss)
+        metrics["iterations"] = iteration
+        metrics["samples_processed"] += batch_size
+        
+        if verbose and iteration % 100 == 0:
+            print(f"Iteration {iteration}/{total_iterations}, Loss: {loss:.4f}, Samples processed: {metrics['samples_processed']}")
+        
+        if iteration % checkpoint_interval == 0:
+            if verbose:
+                print(f"Checkpoint: {iteration} iterations processed. Saving model...")
+            save_models_and_metrics(
+                policy_net_white=model,
+                policy_net_black=model,
+                metrics=None,
+                folder_name="real_data"
+            )
+    
+    if verbose:
+        print("Training complete. Saving final model...")
+    save_models_and_metrics(
+        policy_net_white=model,
+        policy_net_black=model,
+        metrics=None,
+        folder_name="real_data"
+    )
+    
+    return metrics

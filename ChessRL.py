@@ -130,7 +130,7 @@ class ChessRL:
         chess.BISHOP: 3,
         chess.ROOK: 5,
         chess.QUEEN: 9,
-        chess.KING: 100,
+        chess.KING: 0,
     }
     action_space = create_action_space()
     move_to_idx = {move.uci(): idx for idx, move in enumerate(action_space)}
@@ -205,7 +205,7 @@ class ChessRL:
         self.board_tensor = self.board_to_tensor(board)
 
 class ChessPolicyNet(nn.Module, ChessRL):
-    def __init__(self, board, color, device,layers=10, epsilon=0.1):
+    def __init__(self, board, color, device,layers=5, epsilon=0.1):
         nn.Module.__init__(self)
         ChessRL.__init__(self, board, color)
         self.device = device

@@ -13,3 +13,6 @@
 !ChessRL_test.py
 !legacy/
 !legacy/**
+!train_real_data.py
+!train_self_play.py
+!preprocess_PGN.py
