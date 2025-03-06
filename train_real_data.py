@@ -263,12 +263,12 @@ def train_chess_network_from_preprocessed(
 
 # Replace with the path to your preprocessed .pt file.
 data_dir = r"pgn_checkpoints"
-pretrained_model = "real_data11\policy_net.pth"  # Or a valid path if you want to resume training.
+pretrained_model = "real_data1\policy_net.pth"  # Or a valid path if you want to resume training.
 metrics = train_chess_network_from_preprocessed(
     data_dir=data_dir,
     total_iterations=100000000,
     batch_size=64,
-    lr=0.005,
+    lr=0.001,
     layers=2,
     checkpoint_interval=100000,
     pretrained_model_path=pretrained_model,

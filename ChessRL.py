@@ -204,48 +204,227 @@ class ChessRL:
         self.board = board
         self.board_tensor = self.board_to_tensor(board)
 
+class ChessPositionalEvaluator(nn.Module):
+    def __init__(self, device='gpu'):
+        super(ChessPositionalEvaluator, self).__init__()
+        
+        # Initialize opening, middlegame, and endgame tables
+        self.phases = ['opening', 'middlegame', 'endgame']
+        
+        self.pawn_table_opening = nn.Parameter(self._init_table(ChessRL.pawn_table, emphasis='center'))
+        self.knight_table_opening = nn.Parameter(self._init_table(ChessRL.knight_table, emphasis='development'))
+        self.bishop_table_opening = nn.Parameter(self._init_table(ChessRL.bishop_table, emphasis='development'))
+        self.rook_table_opening = nn.Parameter(self._init_table(ChessRL.rook_table, emphasis='development'))
+        self.queen_table_opening = nn.Parameter(self._init_table(ChessRL.queen_table, emphasis='development'))
+        self.king_table_opening = nn.Parameter(self._init_table(ChessRL.king_table, emphasis='kingside'))  # Slight preference for kingside castling
+
+        # Middlegame phase tables (your existing tables are a good start)
+        self.pawn_table_middlegame = nn.Parameter(torch.tensor(ChessRL.pawn_table, device=device))
+        self.knight_table_middlegame = nn.Parameter(self._init_table(ChessRL.knight_table, emphasis='activity'))
+        self.bishop_table_middlegame = nn.Parameter(self._init_table(ChessRL.bishop_table, emphasis='activity'))
+        self.rook_table_middlegame = nn.Parameter(torch.tensor(ChessRL.rook_table, device=device))
+        self.queen_table_middlegame = nn.Parameter(torch.tensor(ChessRL.queen_table, device=device))
+        self.king_table_middlegame = nn.Parameter(torch.tensor(ChessRL.king_table, device=device))
+        
+        # Endgame phase tables (emphasize king centralization, pawn advancement)
+        self.pawn_table_endgame = nn.Parameter(self._init_table(ChessRL.pawn_table, emphasis='advancement'))
+        self.knight_table_endgame = nn.Parameter(self._init_table(ChessRL.knight_table, emphasis='activity'))
+        self.bishop_table_endgame = nn.Parameter(self._init_table(ChessRL.bishop_table, emphasis='activity'))
+        self.rook_table_endgame = nn.Parameter(self._init_table(ChessRL.rook_table, emphasis='activity'))
+        self.queen_table_endgame = nn.Parameter(torch.tensor(ChessRL.queen_table, device=device))
+        self.king_table_endgame = nn.Parameter(self._init_endgame_king_table())
+        
+        # Phase transition thresholds (learnable)
+        self.opening_threshold = nn.Parameter(torch.tensor([30.0], device=device))  # Total material to end opening
+        self.middlegame_threshold = nn.Parameter(torch.tensor([15.0], device=device))  # Total material to end middlegame
+        
+        # Material values (could also be learnable)
+        self.piece_values = nn.Parameter(
+            torch.tensor([1.0, 3.0, 3.0, 5.0, 9.0, 0.0], dtype=torch.float, device=device)
+        )
+    
+    def _init_table(self, base_table, emphasis=None):
+        """Initialize a table with optional emphasis on certain characteristics"""
+        table = base_table.clone().to(self.device)
+        
+        if emphasis == 'center':
+            # Boost center squares
+            center_mask = torch.zeros_like(table)
+            center_mask[3:5, 3:5] = 1.0
+            table += center_mask * 0.05
+            
+        elif emphasis == 'development':
+            # Boost development squares
+            develop_mask = torch.zeros_like(table)
+            develop_mask[0, 1:7] = 1.0  # Back rank except rook squares
+            table += develop_mask * 0.1
+            
+        elif emphasis == 'kingside':
+            # Boost kingside castling preparation
+            kingside_mask = torch.zeros_like(table)
+            kingside_mask[0, 5:7] = 1.0  # f1, g1 squares
+            table += kingside_mask * 0.15
+            
+        elif emphasis == 'queenside':
+            # Boost queenside castling preparation
+            queenside_mask = torch.zeros_like(table)
+            queenside_mask[0, 1:4] = 1.0  # b1, c1, d1 squares
+            table += queenside_mask * 0.12
+            
+        elif emphasis == 'activity':
+            # Boost piece activity (middle of board)
+            activity_mask = torch.zeros_like(table)
+            activity_mask[2:6, 2:6] = 1.0  # Middle 4x4 squares
+            table += activity_mask * 0.08
+            
+        elif emphasis == 'advancement':
+            # Boost advancement (forward ranks)
+            for r in range(8):
+                # Higher value for more advanced positions
+                advancement_value = r * 0.01  # Small incremental bonus
+                advancement_mask = torch.zeros_like(table)
+                advancement_mask[r, :] = 1.0
+                table += advancement_mask * advancement_value
+                
+        return table
+    
+    def _init_endgame_king_table(self):
+        """Initialize an endgame king table that encourages centralization"""
+        table = torch.zeros((8, 8), dtype=torch.float, device=self.device)
+        for r in range(8):
+            for c in range(8):
+                # Distance from center (3.5, 3.5)
+                center_dist = max(abs(r - 3.5), abs(c - 3.5))
+                table[r, c] = (4 - center_dist) / 20.0  # Normalize values
+        return table
+    
+    def _init_endgame_pawn_table(self):
+        """Initialize an endgame pawn table that rewards advancement"""
+        table = torch.zeros((8, 8), dtype=torch.float, device=self.device)
+        for r in range(8):
+            # Higher value for more advanced pawns
+            advancement_value = r / 10.0
+            table[r, :] = advancement_value
+        return table
+    
+    def detect_game_phase(self, board_tensor):
+        """Detect game phase based on material and move number"""
+        # Count total material
+        total_material = 0
+        for piece_type in range(1, 6):  # Exclude king
+            white_pieces = torch.sum(board_tensor[piece_type - 1])
+            black_pieces = torch.sum(board_tensor[piece_type - 1 + 6])
+            total_material += (white_pieces + black_pieces) * self.piece_values[piece_type - 1]
+        
+        # Calculate phase weights
+        opening_weight = torch.sigmoid(self.opening_threshold - total_material)
+        endgame_weight = torch.sigmoid(total_material - self.middlegame_threshold)
+        middlegame_weight = 1.0 - opening_weight - endgame_weight
+        
+        return opening_weight, middlegame_weight, endgame_weight
+    
+    def get_blended_table(self, piece_type, phase_weights):
+        """Get a phase-blended table for a specific piece type"""
+        opening_w, mid_w, end_w = phase_weights
+        
+        if piece_type == chess.PAWN:
+            return (opening_w * self.pawn_table_opening + 
+                    mid_w * self.pawn_table_middlegame + 
+                    end_w * self.pawn_table_endgame)
+        elif piece_type == chess.KNIGHT:
+            return (opening_w * self.knight_table_opening + 
+                    mid_w * self.knight_table_middlegame + 
+                    end_w * self.knight_table_middlegame)  # Use middlegame for endgame too
+        # ... other pieces ...
+        elif piece_type == chess.KING:
+            return (opening_w * self.king_table_opening + 
+                    mid_w * self.king_table_middlegame + 
+                    end_w * self.king_table_endgame)
+    
+    def forward(self, board_tensor, color):
+        """Compute positional value using phase-specific tables"""
+        phase_weights = self.detect_game_phase(board_tensor)
+        
+        value_tensor = torch.zeros_like(board_tensor)
+        for channel in range(12):
+            piece_type = (channel % 6) + 1
+            is_white = channel < 6
+            
+            # Material value
+            material_val = self.piece_values[piece_type - 1]
+            
+            # Get blended table for this piece type
+            table = self.get_blended_table(piece_type, phase_weights)
+            
+            if is_white:
+                value_tensor[channel] = material_val + table
+            else:
+                value_tensor[channel] = -(material_val + torch.flip(table, dims=[0]))
+        
+        # Compute final value
+        total_value = torch.sum(board_tensor * value_tensor)
+        return total_value if color == chess.WHITE else -total_value
+
 class ChessPolicyNet(nn.Module, ChessRL):
-    def __init__(self, board, color, device,layers=5, epsilon=0.1):
+    def __init__(self, board, color, device,layers=5, epsilon=0.1,evaluator=None):
         nn.Module.__init__(self)
         ChessRL.__init__(self, board, color)
         self.device = device
-        
-        # Build a sequential container for 10 conv layers.
+        self.epsilon = epsilon
+
+        self.evaluator = evaluator if evaluator is not None else ChessPositionalEvaluator(device)
+
         conv_layers = []
-        # First layer: input channels 12 -> 32
-        conv_layers.append(nn.Conv2d(12, 32, kernel_size=3, padding=1))
+        # First layer: convert input channels (12) to 128
+        conv_layers.append(nn.Conv2d(in_channels=12, out_channels=128, kernel_size=3, padding=1))
         conv_layers.append(nn.ReLU())
-        # Next 9 layers: keep 32 channels throughout.
-        for _ in range(layers-1):
-            conv_layers.append(nn.Conv2d(32, 32, kernel_size=3, padding=1))
+        
+        if layers > 2:
+            # Add (layers - 2) intermediate layers maintaining 128 channels
+            for _ in range(layers - 2):
+                conv_layers.append(nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, padding=1))
+                conv_layers.append(nn.ReLU())
+        
+        # Keep the last layer at 128 channels as well
+        if layers > 1:
+            conv_layers.append(nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, padding=1))
             conv_layers.append(nn.ReLU())
+        
         self.conv_layers = nn.Sequential(*conv_layers)
         
-        num_actions = len(ChessRL.action_space)
-        # Adjust the fully connected layer to match the conv output: 32 channels * 8 * 8.
-        self.fc1 = nn.Linear(32 * 8 * 8, 512)
-        self.fc2 = nn.Linear(512, num_actions)
+        # After the conv layers, the spatial dimensions remain 8x8
+        self.fc1 = nn.Linear(128 * 8 * 8, 512)
+        self.relu = nn.ReLU()
         
-        self.epsilon = epsilon  # Exploration parameter.
-
+        num_actions = len(ChessRL.action_space)
+        self.policy_head = nn.Linear(512, num_actions)
+        self.value_head = nn.Linear(512, 1)
 
     def forward(self):
-        # Assume board_tensor is up-to-date and has shape (12, 8, 8).
-        x = self.board_tensor.to(self.device).unsqueeze(0)  # Shape: (1, 12, 8, 8)
-        x = self.conv_layers(x)  # Pass through the 10 conv layers.
-        x = x.view(x.size(0), -1)  # Flatten.
-        x = F.relu(self.fc1(x))
-        logits = self.fc2(x)
-        # Apply legal move mask.
-        legal_mask = self.create_legal_mask().to(self.device)  # Shape: (num_actions,)
-        legal_mask = legal_mask.unsqueeze(0).expand_as(logits)
-        masked_logits = logits + (legal_mask - 1) * 1e8
-        probs = F.softmax(masked_logits, dim=-1)
-        return probs
+        if x is None:
+            x = self.board_tensor.to(self.device).unsqueeze(0)  # Add batch dimension
+        
+        # Get positional evaluation from the evaluator
+        pos_value = self.evaluator(x.squeeze(0), self.color)
+        
+        # Process through convolutional layers
+        x = self.conv_layers(x)
+        
+        # Flatten the conv output
+        x_flat = x.view(x.size(0), -1)  # Shape: [batch_size, 128*8*8]
+        
+        # Process through fully connected layer
+        x = self.relu(self.fc1(x_flat))
+        
+        # Output policy logits and value
+        policy_logits = self.policy_head(x)
+        value = self.value_head(x)
+        
+        return policy_logits, value, pos_value
 
     def choose_move(self):
         """Selects a move using epsilon-greedy RL policy."""
-        probs = self.forward()
+        probs,value,pos_value = self.forward()
         if np.random.rand() < self.epsilon:
             legal_moves = list(self.board.legal_moves)
             move = random.choice(legal_moves)
@@ -261,9 +440,10 @@ class ChessPolicyNet(nn.Module, ChessRL):
         return move, log_prob
 
 
-    def reinforce_update(self, optimizer, game_histories, gamma=0.99):
+    def reinforce_update(self, optimizer, game_histories, gamma=0.99, pos_alignment_weight=0.1):
         """
         Perform a REINFORCE update using a batch of game histories.
+        This updated version also trains the positional evaluator.
         
         Args:
             optimizer: The optimizer for updating the network.
@@ -271,19 +451,22 @@ class ChessPolicyNet(nn.Module, ChessRL):
                             Each move dictionary should contain:
                             - "policy_info": a tensor (scalar or [1]) representing the log probability.
                             - "reward": a scalar reward for that move.
+                            - "state": the board tensor at that move.
             gamma: Discount factor.
+            pos_alignment_weight: Weight for the positional alignment loss term.
         
         Returns:
             The average loss (float) computed over the batch.
         """
-        losses = []
+        policy_losses = []
+        pos_alignment_losses = []
 
         # Process each game individually.
         for game in game_histories:
             if len(game) == 0:
                 continue
 
-            # Extract and fix log probabilities for each move.
+            # Extract log probabilities for each move.
             log_probs = [move["policy_info"].squeeze() for move in game]
             log_probs_tensor = torch.stack(log_probs)  # shape: [num_moves]
             
@@ -295,6 +478,19 @@ class ChessPolicyNet(nn.Module, ChessRL):
             if rewards_tensor.numel() == 0:
                 continue
 
+            # For each state in the game, get the positional value
+            states = [move["state"] for move in game]
+            
+            # Forward pass through the evaluator for each state
+            pos_values = []
+            for state in states:
+                # Get the positional evaluation
+                with torch.enable_grad():  # Ensure we're tracking gradients
+                    pos_value = self.evaluator(state, self.color)
+                    pos_values.append(pos_value)
+            
+            pos_values_tensor = torch.stack(pos_values)
+            
             # Create discount factors: [1, gamma, gamma^2, ...]
             discounts = torch.tensor([gamma ** i for i in range(len(rewards_tensor))],
                                     dtype=torch.float32,
@@ -306,132 +502,150 @@ class ChessPolicyNet(nn.Module, ChessRL):
             # Normalize returns for this game.
             returns = (returns - returns.mean()) / (returns.std() + 1e-9)
             
-            # Compute loss for this game.
-            loss = (-log_probs_tensor * returns).mean()
-            losses.append(loss)
+            # Compute policy gradient loss
+            policy_loss = (-log_probs_tensor * returns).mean()
+            policy_losses.append(policy_loss)
+            
+            # Compute alignment loss between positional values and returns
+            # This encourages the positional evaluator to predict expected returns
+            pos_alignment_loss = F.mse_loss(pos_values_tensor, returns)
+            pos_alignment_losses.append(pos_alignment_loss)
 
-        if len(losses) == 0:
+        if len(policy_losses) == 0:
             print("No move history found! Skipping update.")
             return 0.0
 
         # Average the losses over all games.
-        total_loss = torch.stack(losses).mean()
+        avg_policy_loss = torch.stack(policy_losses).mean()
+        avg_pos_alignment_loss = torch.stack(pos_alignment_losses).mean() if pos_alignment_losses else 0
+        
+        # Combine losses
+        total_loss = avg_policy_loss + pos_alignment_weight * avg_pos_alignment_loss
 
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
 
-        print(f"REINFORCE loss: {total_loss.item():.4f}")
+        print(f"REINFORCE policy loss: {avg_policy_loss.item():.4f}, "
+            f"Position alignment loss: {avg_pos_alignment_loss.item():.4f}")
+        
         return total_loss.item()
 
 
-class ChessHybridNet(nn.Module, ChessRL):
-    def __init__(self, board, color, device, layers=2):
-        """
-        If layers == 2, the network uses the original two conv layers:
-          - conv1: 12 -> 32 channels
-          - conv2: 32 -> 64 channels
-        If layers > 2, the network will have one initial layer (12->32),
-        then (layers-2) additional layers maintaining 32 channels,
-        and finally one layer mapping 32 -> 64 channels.
-        """
-        nn.Module.__init__(self)
-        ChessRL.__init__(self, board, color)
-        self.device = device
+# class ChessHybridNet(nn.Module, ChessRL):
+#     def __init__(self, board, color, device, layers=2, epsilon=0.1, evaluator=None):
+#         """
+#         If layers == 2, the network uses the original two conv layers:
+#           - conv1: 12 -> 32 channels
+#           - conv2: 32 -> 64 channels
+#         If layers > 2, the network will have one initial layer (12->32),
+#         then (layers-2) additional layers maintaining 32 channels,
+#         and finally one layer mapping 32 -> 64 channels.
+#         """
+#         nn.Module.__init__(self)
+#         ChessRL.__init__(self, board, color)
+#         self.device = device
+#         self.epsilon = epsilon
 
-        conv_layers = []
-        # First layer: convert input channels (12) to 32.
-        conv_layers.append(nn.Conv2d(in_channels=12, out_channels=32, kernel_size=3, padding=1))
-        conv_layers.append(nn.ReLU())
-        
-        if layers > 2:
-            # Add (layers - 2) intermediate layers with 32 channels.
-            for _ in range(layers - 2):
-                conv_layers.append(nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, padding=1))
-                conv_layers.append(nn.ReLU())
-        
-        # Final layer: convert 32 channels to 64 channels.
-        conv_layers.append(nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1))
-        conv_layers.append(nn.ReLU())
-        
-        self.conv_layers = nn.Sequential(*conv_layers)
-        
-        # After the conv layers, the spatial dimensions remain 8x8.
-        self.fc1 = nn.Linear(64 * 8 * 8, 512)
-        num_actions = len(ChessRL.action_space)
-        self.policy_head = nn.Linear(512, num_actions)
-        self.value_head = nn.Linear(512, 1)
+#         self.evaluator = evaluator if evaluator is not None else ChessPositionalEvaluator(device)
 
-    def choose_move(self, num_simulations=10):
-        best_move, policy_info = mcts_search(self.board, self, self.action_space, num_simulations)
-        return best_move, policy_info
-
-    def forward(self, board_tensor):
-        # If the input is unbatched (shape: [12, 8, 8]), add a batch dimension.
-        if board_tensor.ndim == 3:
-            x = board_tensor.to(self.device).unsqueeze(0)  # Now shape: (1, 12, 8, 8)
-        else:
-            # Assume the input is already batched (shape: [N, 12, 8, 8]).
-            x = board_tensor.to(self.device)
+#         conv_layers = []
+#         # First layer: convert input channels (12) to 128
+#         conv_layers.append(nn.Conv2d(in_channels=12, out_channels=128, kernel_size=3, padding=1))
+#         conv_layers.append(nn.ReLU())
         
-        x = self.conv_layers(x)        # Process through conv layers.
-        x = x.view(x.size(0), -1)        # Flatten: shape becomes (N, 64*8*8)
-        x = F.relu(self.fc1(x))
-        policy_logits = self.policy_head(x)
-        value = torch.tanh(self.value_head(x))  # Value in range [-1,1]
-        return F.softmax(policy_logits, dim=-1), value
+#         if layers > 2:
+#             # Add (layers - 2) intermediate layers maintaining 128 channels
+#             for _ in range(layers - 2):
+#                 conv_layers.append(nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, padding=1))
+#                 conv_layers.append(nn.ReLU())
+        
+#         # Keep the last layer at 128 channels as well
+#         if layers > 1:
+#             conv_layers.append(nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, padding=1))
+#             conv_layers.append(nn.ReLU())
+        
+#         self.conv_layers = nn.Sequential(*conv_layers)
+        
+#         # After the conv layers, the spatial dimensions remain 8x8
+#         self.fc1 = nn.Linear(128 * 8 * 8, 512)
+#         self.relu = nn.ReLU()
+        
+#         num_actions = len(ChessRL.action_space)
+#         self.policy_head = nn.Linear(512, num_actions)
+#         self.value_head = nn.Linear(512, 1)
 
 
-    def reinforce_update(self, optimizer, game_histories):
-        """
-        Perform an update on the hybrid network using self-play samples.
-        Each move dictionary in game_histories should have:
-        - "state": a board tensor (e.g. [12,8,8])
-        - "policy_info": a target policy distribution (numpy array of shape [num_actions])
-        - "target_value": the final outcome from the perspective of the moving agent.
-        
-        Returns:
-        The average loss computed over the batch.
-        """
-        losses = []
-        
-        for game in game_histories:
-            if len(game) == 0:
-                continue
+#     def choose_move(self, num_simulations=10):
+#         best_move, policy_info = mcts_search(self.board, self, self.action_space, num_simulations)
+#         return best_move, policy_info
 
-            for move in game:
-                state = move["state"]  # Assume shape [12, 8, 8]
-                # Forward pass: expected output shapes: 
-                # predicted_policy: (1, num_actions) and predicted_value: (1, 1)
-                predicted_policy, predicted_value = self.forward(state)
+#     def forward(self, board_tensor):
+#         # If the input is unbatched (shape: [12, 8, 8]), add a batch dimension.
+#         if board_tensor.ndim == 3:
+#             x = board_tensor.to(self.device).unsqueeze(0)  # Now shape: (1, 12, 8, 8)
+#         else:
+#             # Assume the input is already batched (shape: [N, 12, 8, 8]).
+#             x = board_tensor.to(self.device)
+        
+#         x = self.conv_layers(x)        # Process through conv layers.
+#         x = x.view(x.size(0), -1)        # Flatten: shape becomes (N, 64*8*8)
+#         x = F.relu(self.fc1(x))
+#         policy_logits = self.policy_head(x)
+#         value = torch.tanh(self.value_head(x))  # Value in range [-1,1]
+#         return F.softmax(policy_logits, dim=-1), value
+
+
+#     def reinforce_update(self, optimizer, game_histories):
+#         """
+#         Perform an update on the hybrid network using self-play samples.
+#         Each move dictionary in game_histories should have:
+#         - "state": a board tensor (e.g. [12,8,8])
+#         - "policy_info": a target policy distribution (numpy array of shape [num_actions])
+#         - "target_value": the final outcome from the perspective of the moving agent.
+        
+#         Returns:
+#         The average loss computed over the batch.
+#         """
+#         losses = []
+        
+#         for game in game_histories:
+#             if len(game) == 0:
+#                 continue
+
+#             for move in game:
+#                 state = move["state"]  # Assume shape [12, 8, 8]
+#                 # Forward pass: expected output shapes: 
+#                 # predicted_policy: (1, num_actions) and predicted_value: (1, 1)
+#                 predicted_policy, predicted_value = self.forward(state)
                 
-                # Convert target policy distribution to tensor (shape: (1, num_actions)).
-                target_policy = torch.tensor(move["policy_info"],
-                                            dtype=torch.float32,
-                                            device=self.device).unsqueeze(0)
+#                 # Convert target policy distribution to tensor (shape: (1, num_actions)).
+#                 target_policy = torch.tensor(move["policy_info"],
+#                                             dtype=torch.float32,
+#                                             device=self.device).unsqueeze(0)
                 
-                # Convert target value to tensor (shape: (1,)).
-                target_value = torch.tensor([move["target_value"]],
-                                            dtype=torch.float32,
-                                            device=self.device)
+#                 # Convert target value to tensor (shape: (1,)).
+#                 target_value = torch.tensor([move["target_value"]],
+#                                             dtype=torch.float32,
+#                                             device=self.device)
                 
-                # Policy loss: equivalent to -sum(target_policy * log(predicted_policy)).
-                policy_loss = -torch.sum(target_policy * torch.log(predicted_policy + 1e-8))
+#                 # Policy loss: equivalent to -sum(target_policy * log(predicted_policy)).
+#                 policy_loss = -torch.sum(target_policy * torch.log(predicted_policy + 1e-8))
                 
-                # Value loss: squared error between predicted value and target value.
-                value_loss = (target_value - predicted_value.squeeze()) ** 2
+#                 # Value loss: squared error between predicted value and target value.
+#                 value_loss = (target_value - predicted_value.squeeze()) ** 2
                 
-                loss = policy_loss + value_loss
-                losses.append(loss)
+#                 loss = policy_loss + value_loss
+#                 losses.append(loss)
         
-        if not losses:
-            print("No move history found! Skipping update.")
-            return 0.0
+#         if not losses:
+#             print("No move history found! Skipping update.")
+#             return 0.0
 
-        total_loss = torch.stack(losses).mean()
-        optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
+#         total_loss = torch.stack(losses).mean()
+#         optimizer.zero_grad()
+#         total_loss.backward()
+#         optimizer.step()
 
-        print(f"REINFORCE loss: {total_loss.item():.4f}")
-        return total_loss.item()
+#         print(f"REINFORCE loss: {total_loss.item():.4f}")
+#         return total_loss.item()

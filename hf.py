@@ -3,10 +3,10 @@
 import os
 import chess
 import chess.pgn
-from ChessRL import ChessPolicyNet,ChessHybridNet
+from ChessRL import ChessPolicyNet,ChessPositionalEvaluator
 import random
 import os
-import glob
+import seaborn as sns
 import numpy as np
 from itertools import cycle
 import torch
@@ -61,9 +61,6 @@ def separate_and_evaluate_game_histories(agent_white, agent_black, game_historie
       - avg_white_points: The average final score for white across the batch.
       - avg_black_points: The average final score for black across the batch.
     """
-    white_value_tensor = agent_white.precompute_value_tensor()
-    black_value_tensor = agent_black.precompute_value_tensor()
-
     white_game_histories = []
     black_game_histories = []
     white_final_scores = []
@@ -87,7 +84,7 @@ def separate_and_evaluate_game_histories(agent_white, agent_black, game_historie
             
             # Compute the intermediate reward.
             if i % 2 == 0:  # White's move.
-                reward = torch.sum(sample['state'] * white_value_tensor).item()
+                reward = agent_white.evaluator(sample['state'], chess.WHITE).item()
                 sample['reward'] = reward
                 if not is_capture:
                     sample['reward'] = non_capture_penalty
@@ -100,7 +97,7 @@ def separate_and_evaluate_game_histories(agent_white, agent_black, game_historie
                             sample['reward'] = repeat_flip_penalty
                 white_moves.append(sample)
             else:  # Black's move.
-                reward = -torch.sum(sample['state'] * black_value_tensor).item()
+                reward = -agent_black.evaluator(sample['state'], chess.BLACK).item()
                 sample['reward'] = reward
                 if not is_capture:
                     sample['reward'] = non_capture_penalty
@@ -193,50 +190,81 @@ def generate_self_play_samples(agent_white, agent_black, game_length, config):
 def train_chess_networks_RL(
     num_iterations=400,
     games_per_iteration=5,
-    game_length = 120,
+    game_length=120,
     epsilon_initial=0.3,
     epsilon_final=0.1,
     lr=0.0004,
+    evaluator_lr=0.00005,  # Slower learning rate for the evaluator
     gamma=0.95,
     non_capture_penalty=0, 
     repeat_flip_penalty=0,
     per_move_penalty=-1,
     exceed_penalty=-50,
-    layers=10,
-    terminal_reward = 200,
+    layers=3,
+    terminal_reward=200,
     pretrained_model_path_white=None,
     pretrained_model_path_black=None,
-    config=None  # Should include any necessary parameters such as config.move_kwargs
+    pretrained_evaluator_path=None,  # Path to a pretrained evaluator
+    config=None
 ):
-    # Initialize agents (using your current RL network)
-    agent_white = ChessPolicyNet(
+    # Create a shared positional evaluator
+    evaluator = ChessPositionalEvaluator(device=device)
+    
+    # Load pretrained evaluator if provided
+    if pretrained_evaluator_path:
+        evaluator.load_state_dict(torch.load(pretrained_evaluator_path, map_location=device))
+    
+    # Initialize agents with the shared evaluator
+    agent_white = ChessHybridNet(
         board=chess.Board(),
         color=chess.WHITE,
         device=device,
         layers=layers,
-        epsilon=epsilon_initial
+        epsilon=epsilon_initial,
+        evaluator=evaluator
     ).to(device)
-    agent_black = ChessPolicyNet(
+    
+    agent_black = ChessHybridNet(
         board=chess.Board(),
         color=chess.BLACK,
         device=device,
         layers=layers,
-        epsilon=epsilon_initial
+        epsilon=epsilon_initial,
+        evaluator=evaluator
     ).to(device)
     
-    # Load pretrained weights if provided.
+    # Load pretrained weights if provided
     if pretrained_model_path_white:
-        agent_white.load_state_dict(torch.load(pretrained_model_path_white, map_location=device))
+        # Filter out evaluator parameters when loading
+        pretrained_dict = torch.load(pretrained_model_path_white, map_location=device)
+        model_dict = agent_white.state_dict()
+        pretrained_dict = {k: v for k, v in pretrained_dict.items() if 'evaluator' not in k}
+        model_dict.update(pretrained_dict)
+        agent_white.load_state_dict(model_dict)
+        
     if pretrained_model_path_black:
-        agent_black.load_state_dict(torch.load(pretrained_model_path_black, map_location=device))
+        # Filter out evaluator parameters when loading
+        pretrained_dict = torch.load(pretrained_model_path_black, map_location=device)
+        model_dict = agent_black.state_dict()
+        pretrained_dict = {k: v for k, v in pretrained_dict.items() if 'evaluator' not in k}
+        model_dict.update(pretrained_dict)
+        agent_black.load_state_dict(model_dict)
     
     agent_white.train()
     agent_black.train()
 
-    optimizer_white = torch.optim.Adam(agent_white.parameters(), lr=lr)
-    optimizer_black = torch.optim.Adam(agent_black.parameters(), lr=lr)
+    # Create optimizers with different learning rates for policy and evaluator
+    optimizer_white = torch.optim.Adam([
+        {'params': [p for n, p in agent_white.named_parameters() if 'evaluator' not in n], 'lr': lr},
+        {'params': evaluator.parameters(), 'lr': evaluator_lr}  # Slower learning for tables
+    ])
+    
+    optimizer_black = torch.optim.Adam([
+        {'params': [p for n, p in agent_black.named_parameters() if 'evaluator' not in n], 'lr': lr}
+        # Evaluator already included in white's optimizer
+    ])
 
-    # Metrics dictionary to track progress.
+    # Metrics dictionary to track progress
     metrics = {
         "white_loss_list": [],
         "black_loss_list": [],
@@ -245,11 +273,12 @@ def train_chess_networks_RL(
         "game_length_list": [],
         "white_win_rates": [],
         "black_win_rates": [],
-        "draw_rates": []
+        "draw_rates": [],
+        "evaluator_tables": []  # Track table changes
     }
 
     for iteration in range(num_iterations):
-        # Decay epsilon over time.
+        # Decay epsilon over time
         epsilon = max(epsilon_final, epsilon_initial - (epsilon_initial - epsilon_final) * (iteration / num_iterations))
         agent_white.epsilon = epsilon
         agent_black.epsilon = epsilon
@@ -261,25 +290,28 @@ def train_chess_networks_RL(
         results = []
 
         for _ in range(games_per_iteration):
-            # Generate one self-play game.
+            # Generate one self-play game
             samples, result = generate_self_play_samples(agent_white, agent_black, game_length, config)
             game_lengths.append(len(samples))
             results.append(result)
             print(results[-1])
             
-            # (Optionally, you could split samples based on turn or agent.)
             game_histories.append(samples)
 
+        # Modified to use evaluator directly in the reward calculation
         (white_game_histories, 
          black_game_histories, 
          white_avg_points, 
-         black_avg_points) = separate_and_evaluate_game_histories(agent_white, agent_black, game_histories, results, terminal_reward, per_move_penalty,
-                                           game_length, exceed_penalty, non_capture_penalty, repeat_flip_penalty)
+         black_avg_points) = separate_and_evaluate_game_histories(
+             agent_white, agent_black, game_histories, results, 
+             terminal_reward, per_move_penalty, game_length, exceed_penalty, 
+             non_capture_penalty, repeat_flip_penalty)
         
-        white_loss = agent_white.reinforce_update(optimizer_white, white_game_histories,gamma=gamma)
-        black_loss = agent_black.reinforce_update(optimizer_black, black_game_histories,gamma=gamma)
+        # Updated reinforce_update methods that now train the evaluator too
+        white_loss = agent_white.reinforce_update(optimizer_white, white_game_histories, gamma=gamma)
+        black_loss = agent_black.reinforce_update(optimizer_black, black_game_histories, gamma=gamma)
 
-        # Compute win/draw statistics.
+        # Compute win/draw statistics
         white_wins = results.count("1-0")
         black_wins = results.count("0-1")
         draws = results.count("1/2-1/2")
@@ -292,24 +324,45 @@ def train_chess_networks_RL(
         metrics["black_loss_list"].append(black_loss)
         metrics["white_avg_points"].append(white_avg_points)
         metrics["black_avg_points"].append(black_avg_points)
+        
+        # Periodically save table snapshots to track evolution
+        if iteration % 10 == 0:
+            # Save a copy of the current evaluator state (tables only)
+            table_snapshot = {name: param.clone().detach().cpu() 
+                             for name, param in evaluator.named_parameters() 
+                             if 'table' in name}
+            metrics["evaluator_tables"].append((iteration, table_snapshot))
 
-        # Log the progress.
+        # Log the progress
         print(f"Iteration {iteration+1} completed: Avg Length {np.mean(game_lengths)/2:.2f}, "
               f"White win rate {white_wins / total_games:.2f}, Black win rate {black_wins / total_games:.2f}, "
               f"Draw rate {draws / total_games:.2f}")
 
-        # Save checkpoint every 100 iterations.
-        if (iteration + 1) % 1000 == 0:
+        # Save checkpoint periodically
+        if (iteration + 1) % 100 == 0:
             print(f"Saving checkpoint at iteration {iteration+1}...")
             save_models_and_metrics(
                 policy_net_white=agent_white,
                 policy_net_black=agent_black,
-                metrics=metrics
+                evaluator=evaluator,  # Also save the evaluator separately
+                metrics=metrics,
+                iteration=iteration+1
             )
-    # Optionally, save your metrics to disk.
-    save_models_and_metrics(policy_net_white=agent_white, policy_net_black=agent_black, metrics=metrics)
+            
+            # # Visualize how tables are evolving
+            # if hasattr(evaluator, 'pawn_table_middlegame'):
+            #     visualize_tables_evolution(evaluator, iteration+1)
+            
+    # Save final models and metrics
+    save_models_and_metrics(
+        policy_net_white=agent_white,
+        policy_net_black=agent_black,
+        evaluator=evaluator,
+        metrics=metrics,
+        iteration=num_iterations
+    )
 
-    return metrics
+    return metrics, evaluator
 
 def get_next_run_directory(base_dir=".", folder_name="run"):
     """Find the next available run directory (run1, run2, ...)."""
@@ -318,26 +371,169 @@ def get_next_run_directory(base_dir=".", folder_name="run"):
         run_number += 1
     return os.path.join(base_dir, f"{folder_name}{run_number}")
 
-def save_models_and_metrics(policy_net_white, policy_net_black, metrics, base_dir=".", save_to_drive=False, folder_name="run"):
-    """Save models and a training metrics plot in an incrementing run directory."""
-    save_dir = get_next_run_directory(base_dir, folder_name)
-    if save_to_drive:
-        save_dir = os.path.join('/content/drive/MyDrive/ML_States', save_dir)
-    os.makedirs(save_dir, exist_ok=True)
+def save_models_and_metrics(policy_net_white, policy_net_black, metrics, evaluator=None, 
+                            base_dir=".", folder_name="run", iteration=None):
+    """Save models, evaluator, and training metrics in an incrementing run directory."""
+    # If iteration is provided, use it as a subfolder
+    if iteration is not None:
+        subfolder = f"iter_{iteration}"
+    else:
+        subfolder = ""
     
-    # Save the models.
+    # Get the base save directory
+    if not os.path.exists(os.path.join(base_dir, folder_name)):
+        save_dir = os.path.join(base_dir, folder_name)
+        os.makedirs(save_dir, exist_ok=True)
+    else:
+        save_dir = os.path.join(base_dir, folder_name)
+    
+    # Add subfolder if needed
+    if subfolder:
+        save_dir = os.path.join(save_dir, subfolder)
+        os.makedirs(save_dir, exist_ok=True)
+    
+    # Save the models
     torch.save(policy_net_white.state_dict(), os.path.join(save_dir, "policy_net_white.pth"))
     torch.save(policy_net_black.state_dict(), os.path.join(save_dir, "policy_net_black.pth"))
+    
+    # Save the evaluator if provided
+    if evaluator is not None:
+        torch.save(evaluator.state_dict(), os.path.join(save_dir, "positional_evaluator.pth"))
+        
+        # Create a tables directory to store visualizations
+        tables_dir = os.path.join(save_dir, "tables")
+        os.makedirs(tables_dir, exist_ok=True)
+        
+        # Visualize all piece tables for each phase
+        for piece in ['pawn', 'knight', 'bishop', 'rook', 'queen', 'king']:
+            for phase in ['opening', 'middlegame', 'endgame']:
+                attr_name = f"{piece}_table_{phase}"
+                if hasattr(evaluator, attr_name):
+                    table = getattr(evaluator, attr_name)
+                    
+                    plt.figure(figsize=(6, 6))
+                    table_np = table.detach().cpu().numpy()
+                    sns.heatmap(table_np, annot=True, cmap='coolwarm', 
+                              vmin=-0.3, vmax=0.3, fmt='.2f')
+                    plt.title(f"{piece.capitalize()} {phase}")
+                    plt.savefig(os.path.join(tables_dir, f"{piece}_{phase}.png"))
+                    plt.close()
+    
     print(f"Models saved in {save_dir}")
     
+    # Save and plot metrics if provided
     if metrics is not None:
+        # Save raw metrics data
+        metrics_path = os.path.join(save_dir, "training_metrics.pkl")
+        with open(metrics_path, 'wb') as f:
+            pickle.dump({k: v for k, v in metrics.items() if k != "evaluator_tables"}, f)
+        
+        # If we're tracking table evolution, save that separately
+        if "evaluator_tables" in metrics:
+            tables_evolution_path = os.path.join(save_dir, "table_evolution.pt")
+            torch.save(metrics["evaluator_tables"], tables_evolution_path)
+        
+        # Create and save the metrics plot
         fig = plot_training_metrics_binned(metrics)
         plot_path = os.path.join(save_dir, "training_metrics.png")
         fig.savefig(plot_path)
         plt.close(fig)  # Close the figure to free up memory
+        
         print(f"Training metrics plot saved in {plot_path}")
     else:
-        print(f'model saved to {plot_path}')
+        print(f"Models saved to {save_dir}")
+
+def plot_training_metrics_binned(metrics, num_bins=20):
+    """Plot training metrics by binning the iteration data to provide a clearer view of trends."""
+    # Set up a 2x3 grid for plotting
+    fig, axs = plt.subplots(2, 2, figsize=(18, 10))
+
+    # 1. Binned REINFORCE Loss for White and Black
+    iterations, white_loss_means, white_loss_stds = bin_data(metrics['white_loss_list'], num_bins)
+    _, black_loss_means, black_loss_stds = bin_data(metrics['black_loss_list'], num_bins)
+    axs[0, 0].errorbar(iterations, white_loss_means, yerr=white_loss_stds, marker='o', color='blue', label='White Loss')
+    axs[0, 0].errorbar(iterations, black_loss_means, yerr=black_loss_stds, marker='o', color='red', label='Black Loss')
+    axs[0, 0].set_xlabel("Iteration")
+    axs[0, 0].set_ylabel("Loss")
+    axs[0, 0].set_title("Binned REINFORCE Loss per Iteration")
+    axs[0, 0].legend()
+    axs[0, 0].grid(True)
+
+    # 2. Binned Average Points per Iteration
+    iterations, white_avg_points_means, white_avg_points_stds = bin_data(metrics['white_avg_points'], num_bins)
+    _, black_avg_points_means, black_avg_points_stds = bin_data(metrics['black_avg_points'], num_bins)
+    axs[0, 1].errorbar(iterations, white_avg_points_means, yerr=white_avg_points_stds, marker='o', color='blue', label='White Avg Points')
+    axs[0, 1].errorbar(iterations, black_avg_points_means, yerr=black_avg_points_stds, marker='o', color='red', label='Black Avg Points')
+    axs[0, 1].set_xlabel("Iteration")
+    axs[0, 1].set_ylabel("Avg Points")
+    axs[0, 1].set_title("Binned Average Points per Iteration")
+    axs[0, 1].legend()
+    axs[0, 1].grid(True)
+
+    # 3. Binned Average Game Length per Iteration
+    iterations, game_length_means, game_length_stds = bin_data(metrics['game_length_list'], num_bins)
+    axs[1, 1].errorbar(iterations, game_length_means, yerr=game_length_stds, marker='o', color='purple')
+    axs[1, 1].set_xlabel("Iteration")
+    axs[1, 1].set_ylabel("Moves")
+    axs[1, 1].set_title("Binned Average Game Length per Iteration")
+    axs[1, 1].grid(True)
+
+    # 4. Binned Win/Loss/Draw Rates per Iteration
+    iterations, white_win_rates_means, white_win_rates_stds = bin_data(metrics['white_win_rates'], num_bins)
+    _, black_win_rates_means, black_win_rates_stds = bin_data(metrics['black_win_rates'], num_bins)
+    _, draw_rates_means, draw_rates_stds = bin_data(metrics['draw_rates'], num_bins)
+    axs[1, 0].errorbar(iterations, white_win_rates_means, yerr=white_win_rates_stds, marker='o', color='blue', label='White Win Rate')
+    axs[1, 0].errorbar(iterations, black_win_rates_means, yerr=black_win_rates_stds, marker='o', color='red', label='Black Win Rate')
+    axs[1, 0].errorbar(iterations, draw_rates_means, yerr=draw_rates_stds, marker='o', color='green', label='Draw Rate')
+    axs[1, 0].set_xlabel("Iteration")
+    axs[1, 0].set_ylabel("Rate")
+    axs[1, 0].set_title("Binned Win/Loss/Draw Rates per Iteration")
+    axs[1, 0].legend()
+    axs[1, 0].grid(True)
+
+    plt.tight_layout()
+    return fig
+
+def visualize_table_evolution(metrics, piece="pawn", phase="middlegame", num_iterations=5):
+    """Visualize how a specific piece-square table evolved during training."""
+    if "evaluator_tables" not in metrics:
+        print("No table evolution data found in metrics.")
+        return
+    
+    # Extract the table evolution data
+    table_data = metrics["evaluator_tables"]
+    
+    # Select iterations to visualize (evenly spaced)
+    if len(table_data) <= num_iterations:
+        iterations_to_show = range(len(table_data))
+    else:
+        step = len(table_data) // num_iterations
+        iterations_to_show = range(0, len(table_data), step)
+    
+    # Create a grid of subplots
+    fig, axs = plt.subplots(1, len(iterations_to_show), figsize=(15, 5))
+    if len(iterations_to_show) == 1:
+        axs = [axs]  # Make it iterable if only one subplot
+    
+    # Plot each selected iteration
+    for i, idx in enumerate(iterations_to_show):
+        iteration, tables = table_data[idx]
+        table_key = f"{piece}_table_{phase}"
+        
+        if table_key in tables:
+            table = tables[table_key]
+            sns.heatmap(table.numpy(), annot=True, cmap='coolwarm', 
+                       vmin=-0.3, vmax=0.3, ax=axs[i], fmt='.2f')
+            axs[i].set_title(f"Iteration {iteration}")
+            
+            # Remove tick labels except for the first plot
+            if i > 0:
+                axs[i].set_ylabel('')
+                axs[i].set_yticklabels([])
+    
+    fig.suptitle(f"Evolution of {piece.capitalize()} {phase} table", fontsize=16)
+    plt.tight_layout()
+    return fig
 
 def bin_data(data, num_bins):
     """
@@ -366,74 +562,6 @@ def bin_data(data, num_bins):
         # Use the midpoint of the bin as the representative iteration number:
         bin_centers.append(i + len(bin_slice) / 2.0)
     return np.array(bin_centers), np.array(bin_means), np.array(bin_stds)
-
-def plot_training_metrics_binned(metrics, num_bins=20):
-    """
-    Plot training metrics by binning the iteration data to provide a clearer view of trends.
-    
-    Parameters:
-        metrics (dict): Dictionary containing the following keys:
-            - white_loss_list
-            - black_loss_list
-            - white_avg_points
-            - black_avg_points
-            - white_avg_log_probs
-            - black_avg_log_probs
-            - game_length_list
-            - white_win_rates
-            - black_win_rates
-            - draw_rates
-        num_bins (int): Number of bins into which the iterations will be grouped.
-    """
-    # Set up a 2x3 grid for plotting.
-    fig, axs = plt.subplots(2, 2, figsize=(18, 10))
-
-    # 1. Binned REINFORCE Loss for White and Black.
-    iterations, white_loss_means, white_loss_stds = bin_data(metrics['white_loss_list'], num_bins)
-    _, black_loss_means, black_loss_stds = bin_data(metrics['black_loss_list'], num_bins)
-    axs[0, 0].errorbar(iterations, white_loss_means, yerr=white_loss_stds, marker='o', color='blue', label='White Loss')
-    axs[0, 0].errorbar(iterations, black_loss_means, yerr=black_loss_stds, marker='o', color='red', label='Black Loss')
-    axs[0, 0].set_xlabel("Iteration")
-    axs[0, 0].set_ylabel("Loss")
-    axs[0, 0].set_title("Binned REINFORCE Loss per Iteration")
-    axs[0, 0].legend()
-    axs[0, 0].grid(True)
-
-    # 2. Binned Average Points per Iteration.
-    iterations, white_avg_points_means, white_avg_points_stds = bin_data(metrics['white_avg_points'], num_bins)
-    _, black_avg_points_means, black_avg_points_stds = bin_data(metrics['black_avg_points'], num_bins)
-    axs[0, 1].errorbar(iterations, white_avg_points_means, yerr=white_avg_points_stds, marker='o', color='blue', label='White Avg Points')
-    axs[0, 1].errorbar(iterations, black_avg_points_means, yerr=black_avg_points_stds, marker='o', color='red', label='Black Avg Points')
-    axs[0, 1].set_xlabel("Iteration")
-    axs[0, 1].set_ylabel("Avg Points")
-    axs[0, 1].set_title("Binned Average Points per Iteration")
-    axs[0, 1].legend()
-    axs[0, 1].grid(True)
-
-
-    # 5. Binned Average Game Length per Iteration.
-    iterations, game_length_means, game_length_stds = bin_data(metrics['game_length_list'], num_bins)
-    axs[1, 1].errorbar(iterations, game_length_means, yerr=game_length_stds, marker='o', color='purple')
-    axs[1, 1].set_xlabel("Iteration")
-    axs[1, 1].set_ylabel("Moves")
-    axs[1, 1].set_title("Binned Average Game Length per Iteration")
-    axs[1, 1].grid(True)
-
-    # 6. Binned Win/Loss/Draw Rates per Iteration.
-    iterations, white_win_rates_means, white_win_rates_stds = bin_data(metrics['white_win_rates'], num_bins)
-    _, black_win_rates_means, black_win_rates_stds = bin_data(metrics['black_win_rates'], num_bins)
-    _, draw_rates_means, draw_rates_stds = bin_data(metrics['draw_rates'], num_bins)
-    axs[1, 0].errorbar(iterations, white_win_rates_means, yerr=white_win_rates_stds, marker='o', color='blue', label='White Win Rate')
-    axs[1, 0].errorbar(iterations, black_win_rates_means, yerr=black_win_rates_stds, marker='o', color='red', label='Black Win Rate')
-    axs[1, 0].errorbar(iterations, draw_rates_means, yerr=draw_rates_stds, marker='o', color='green', label='Draw Rate')
-    axs[1, 0].set_xlabel("Iteration")
-    axs[1, 0].set_ylabel("Rate")
-    axs[1, 0].set_title("Binned Win/Loss/Draw Rates per Iteration")
-    axs[1, 0].legend()
-    axs[1, 0].grid(True)
-
-    plt.tight_layout()
-    return fig
 
 def train_chess_networks_hybrid(
     num_iterations=400,
@@ -713,143 +841,3 @@ def print_custom_board(board):
         file_str += f"{file_letter:^{cell_width}}"
     print(file_str)
     print()
-
-
-def train_chess_network_from_preprocessed(
-   data_dir,                  # Folder containing .pt files
-    total_iterations=100000,   # Total mini-batch updates
-    batch_size=32,
-    lr=0.0001,
-    layers=5,
-    checkpoint_interval=10000, # Save model every this many iterations
-    pretrained_model_path=None,
-    verbose=True
-):
-    """
-    Train a ChessPolicyNet model using preprocessed samples stored in .pt files.
-    
-    Each .pt file in data_dir is expected to contain a list of tuples:
-        (state_tensor, UCI_move, move_index, result)
-    
-    For training, only the (state_tensor, move_index) pair is used.
-    
-    The function loads all .pt files from data_dir in random order, combines the samples,
-    shuffles them, and then uses them in a mini-batch training loop.
-    
-    Parameters:
-      data_dir (str): Folder containing the preprocessed .pt files.
-      total_iterations (int): Total training iterations (mini-batch updates).
-      batch_size (int): Mini-batch size.
-      lr (float): Learning rate.
-      layers (int): Number of convolutional layers for the model.
-      checkpoint_interval (int): Save checkpoint every this many iterations.
-      pretrained_model_path (str or None): Path to a pretrained model (if any).
-      verbose (bool): If True, prints progress messages.
-      
-    Returns:
-      metrics (dict): Training metrics.
-    """
-    # Gather all .pt files in the folder.
-    pt_files = glob.glob(os.path.join(data_dir, "*.pt"))
-    if verbose:
-        print(f"Found {len(pt_files)} .pt files in '{data_dir}'.")
-    # Shuffle file list in random order.
-    random.shuffle(pt_files)
-    
-    # Load and combine all training samples from the files.
-    training_samples = []
-    for pt_file in pt_files:
-        data = torch.load(pt_file)
-        # Each file should contain a list of tuples:
-        # (state_tensor, UCI_move, move_index, result)
-        training_samples.extend(data)
-        if verbose:
-            print(f"Loaded {len(data)} samples from {pt_file}.")
-    
-    if verbose:
-        print(f"Total training samples loaded: {len(training_samples)}.")
-    
-    # For training, extract only the (state_tensor, move_index) pairs.
-    training_samples = [(state, move_idx) for (state, uci_move, move_idx, result) in training_samples]
-    random.shuffle(training_samples)
-    
-    # Initialize the model.
-    model = ChessPolicyNet(
-        board=chess.Board(),
-        color=chess.WHITE,  # Arbitrary in a single-model setup
-        device=device,
-        layers=layers,
-        epsilon=0.0      # No exploration during supervised training.
-    ).to(device)
-    
-    if pretrained_model_path:
-        model.load_state_dict(torch.load(pretrained_model_path, map_location=device))
-        if verbose:
-            print(f"Loaded pretrained weights from {pretrained_model_path}")
-    
-    model.train()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    
-    metrics = {
-        "losses": [],
-        "iterations": 0,
-        "samples_processed": 0
-    }
-    iteration = 0
-    num_samples = len(training_samples)
-    sample_index = 0  # pointer in training_samples
-    
-    def update_on_batch(agent, optimizer, batch_samples):
-        # Stack state tensors into a single tensor of shape (B, 12, 8, 8)
-        states = torch.stack([sample[0] for sample in batch_samples]).to(device)
-        targets = torch.tensor([sample[1] for sample in batch_samples], dtype=torch.long, device=device)
-        optimizer.zero_grad()
-        x = agent.conv_layers(states)
-        x = x.view(x.size(0), -1)
-        x = F.relu(agent.fc1(x))
-        logits = agent.fc2(x)
-        loss = F.cross_entropy(logits, targets)
-        loss.backward()
-        optimizer.step()
-        return loss.item()
-    
-    if verbose:
-        print("Starting training using preprocessed folder data...")
-    
-    # Training loop.
-    while iteration < total_iterations:
-        # If we've reached the end of the samples, reshuffle and restart.
-        if sample_index + batch_size > num_samples:
-            random.shuffle(training_samples)
-            sample_index = 0
-        batch = training_samples[sample_index: sample_index + batch_size]
-        sample_index += batch_size
-        loss = update_on_batch(model, optimizer, batch)
-        iteration += 1
-        metrics["losses"].append(loss)
-        metrics["iterations"] = iteration
-        metrics["samples_processed"] += batch_size
-        
-        if verbose and iteration % 100 == 0:
-            print(f"Iteration {iteration}/{total_iterations}, Loss: {loss:.4f}, Samples processed: {metrics['samples_processed']}")
-        
-        if iteration % checkpoint_interval == 0:
-            if verbose:
-                print(f"Checkpoint: {iteration} iterations processed. Saving model...")
-            save_models_and_metrics(
-                policy_net_white=model,
-                policy_net_black=model,
-                metrics=None,
-                folder_name="real_data"
-            )
-    
-    if verbose:
-        print("Training complete. Saving final model...")
-    save_models_and_metrics(
-        policy_net_white=model,
-        policy_net_black=model,
-        metrics=None,
-        folder_name="real_data"
-    )
-    
-    return metrics
