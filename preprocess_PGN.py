@@ -165,8 +165,8 @@ class ChessDataset:
         """
         checkpoint = np.load(checkpoint_file)
         return {
-            'states': torch.from_numpy(checkpoint['states']),
-            'moves': torch.from_numpy(checkpoint['moves']),
+            'states': torch.from_numpy(checkpoint['states']).float(),  # Convert to float32
+            'moves': torch.from_numpy(checkpoint['moves']).long(),     # Convert to int64
             'results': checkpoint['results'],
             'ucis': checkpoint['ucis']
         }

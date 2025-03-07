@@ -2,19 +2,19 @@ import os
 import chess
 from ChessRL import ChessPolicyNet
 import random
-import os
 from itertools import cycle
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import glob
+import numpy as np
+
 if torch.cuda.is_available():
     device = torch.device("cuda")  # Use the first available GPU
     print("GPU is available and being used.")
 else:
     device = torch.device("cpu")
     print("GPU not available, using CPU instead.")
-import numpy as np
 
 def get_next_run_directory(base_dir=".", folder_name="run"):
     """Find the next available run directory (run1, run2, ...)."""
@@ -46,20 +46,10 @@ def save_models_and_metrics(policy_net, metrics, base_dir=".", save_to_drive=Fal
     plt.close(fig)  # Free up memory by closing the figure.
     print(f"Training metrics plot saved in {plot_path}")
 
-
 def bin_data(data, num_bins):
     """
     Splits a list/array of data into a specified number of bins,
     and computes the mean and standard deviation in each bin.
-    
-    Parameters:
-        data (list or np.array): The data to be binned.
-        num_bins (int): Number of bins to aggregate the data into.
-    
-    Returns:
-        bin_centers (np.array): The x-axis positions (bin centers).
-        bin_means (np.array): The mean value in each bin.
-        bin_stds (np.array): The standard deviation in each bin.
     """
     data = np.array(data)
     n = len(data)
@@ -77,17 +67,6 @@ def bin_data(data, num_bins):
 def plot_training_metrics_binned(metrics, num_bins=20):
     """
     Plot training metrics by binning the iteration data.
-    
-    This version is adapted for supervised training. It expects the metrics dictionary
-    to contain a key 'losses' (a list of loss values from training iterations) and plots
-    the binned average loss vs. iteration number.
-    
-    Parameters:
-        metrics (dict): Dictionary containing training metrics. Must include 'losses'.
-        num_bins (int): Number of bins into which the loss data will be aggregated.
-    
-    Returns:
-        fig (matplotlib.figure.Figure): The figure object containing the plot.
     """
     losses = metrics.get("losses", [])
     if len(losses) == 0:
@@ -110,27 +89,56 @@ def plot_training_metrics_binned(metrics, num_bins=20):
     
     return fig
 
-def update_on_batch(agent, optimizer, batch_samples):
-    """
-    Performs a supervised update on a batch of samples.
-    Each sample is a tuple (state_tensor, move_index).
-    """
-    # Stack state tensors into a single tensor of shape (B, 12, 8, 8)
-    states = torch.stack([sample[0] for sample in batch_samples]).to(device)
-    targets = torch.tensor([sample[1] for sample in batch_samples], dtype=torch.long, device=device)
-    optimizer.zero_grad()
-    x = agent.conv_layers(states)
-    x = x.view(x.size(0), -1)
-    x = F.relu(agent.fc1(x))
-    logits = agent.fc2(x)
-    loss = F.cross_entropy(logits, targets)
-    loss.backward()
-    optimizer.step()
-    return loss.item()
+# The simplified policy network that doesn't use the evaluator
+class SimplePolicyNet(torch.nn.Module):
+    def __init__(self, layers=5):
+        super(SimplePolicyNet, self).__init__()
+        
+        conv_layers = []
+        # First layer: convert input channels (12) to 128
+        conv_layers.append(torch.nn.Conv2d(in_channels=12, out_channels=128, kernel_size=3, padding=1))
+        conv_layers.append(torch.nn.ReLU())
+        
+        if layers > 2:
+            # Add (layers - 2) intermediate layers maintaining 128 channels
+            for _ in range(layers - 2):
+                conv_layers.append(torch.nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, padding=1))
+                conv_layers.append(torch.nn.ReLU())
+        
+        # Keep the last layer at 128 channels as well
+        if layers > 1:
+            conv_layers.append(torch.nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, padding=1))
+            conv_layers.append(torch.nn.ReLU())
+        
+        self.conv_layers = torch.nn.Sequential(*conv_layers)
+        
+        # After the conv layers, the spatial dimensions remain 8x8
+        self.fc1 = torch.nn.Linear(128 * 8 * 8, 512)
+        self.relu = torch.nn.ReLU()
+        
+        from ChessRL import create_action_space
+        action_space = create_action_space()
+        num_actions = len(action_space)
+        self.policy_head = torch.nn.Linear(512, num_actions)
+    
+    def forward(self, x):
+        # Process through convolutional layers
+        x = self.conv_layers(x)
+        
+        # Flatten the conv output
+        x_flat = x.view(x.size(0), -1)  # Shape: [batch_size, 128*8*8]
+        
+        # Process through fully connected layer
+        x = self.relu(self.fc1(x_flat))
+        
+        # Output policy logits
+        policy_logits = self.policy_head(x)
+        
+        return policy_logits
 
 def train_chess_network_from_preprocessed(
-    data_dir,                  # Folder containing .pt files
-    total_iterations=120000,   # Total mini-batch updates
+    data_dir,                  # Folder containing .npz files
+    num_epochs=1,              # Number of complete passes through all data files
     batch_size=100,
     lr=0.0005,
     layers=5,
@@ -139,51 +147,34 @@ def train_chess_network_from_preprocessed(
     verbose=True
 ):
     """
-    Train a ChessPolicyNet model using preprocessed samples stored in .pt files.
-    
-    Each .pt file in data_dir is expected to contain a list of tuples:
-        (state_tensor, UCI_move, move_index, result)
-    
-    For training, only the (state_tensor, move_index) pair is used.
-    
-    Instead of loading all files at once, this function loads one file at a time,
-    processes its samples in mini-batches, then moves on to the next file.
-    The files are processed in random order and reshuffled once all files are done.
-    
-    Parameters:
-      data_dir (str): Folder containing the preprocessed .pt files.
-      total_iterations (int): Total training iterations (mini-batch updates).
-      batch_size (int): Mini-batch size.
-      lr (float): Learning rate.
-      layers (int): Number of convolutional layers for the model.
-      checkpoint_interval (int): Save checkpoint every this many iterations.
-      pretrained_model_path (str or None): Path to a pretrained model (if any).
-      verbose (bool): If True, prints progress messages.
-      
-    Returns:
-      metrics (dict): Training metrics.
+    Train a simplified policy network using preprocessed samples stored in .npz files.
     """
-    # Gather all .pt files in the folder.
-    pt_files = glob.glob(os.path.join(data_dir, "*.pt"))
+    # Gather all .npz files in the folder.
+    npz_files = glob.glob(os.path.join(data_dir, "*.npz"))
     if verbose:
-        print(f"Found {len(pt_files)} .pt files in '{data_dir}'.")
-    # Shuffle the file list randomly.
-    random.shuffle(pt_files)
-    num_files = len(pt_files)
+        print(f"Found {len(npz_files)} .npz files in '{data_dir}'.")
+    num_files = len(npz_files)
+    if num_files == 0:
+        raise ValueError(f"No .npz files found in {data_dir}")
     
-    # Initialize the model.
-    model = ChessPolicyNet(
-        board=chess.Board(),
-        color=chess.WHITE,  # Arbitrary in a single-model setup
-        device=device,
-        layers=layers,
-        epsilon=0.0      # No exploration during supervised training.
-    ).to(device)
+    # Initialize a simplified model that doesn't use the evaluator
+    model = SimplePolicyNet(layers=layers).to(device)
     
     if pretrained_model_path:
-        model.load_state_dict(torch.load(pretrained_model_path, map_location=device,weights_only=True))
+        # Load weights only for the matching layers
+        pretrained_dict = torch.load(pretrained_model_path, map_location=device)
+        model_dict = model.state_dict()
+        
+        # Filter out unnecessary keys
+        filtered_dict = {k: v for k, v in pretrained_dict.items() 
+                        if k in model_dict and model_dict[k].shape == v.shape}
+        
+        # Update model weights
+        model_dict.update(filtered_dict)
+        model.load_state_dict(model_dict)
+        
         if verbose:
-            print(f"Loaded pretrained weights from {pretrained_model_path}")
+            print(f"Loaded compatible pretrained weights from {pretrained_model_path}")
     
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -191,86 +182,130 @@ def train_chess_network_from_preprocessed(
     metrics = {
         "losses": [],
         "iterations": 0,
-        "samples_processed": 0
+        "samples_processed": 0,
+        "epochs_completed": 0,
+        "files_processed": 0
     }
     iteration = 0
     
-    file_index = 0  # Pointer to current file in the list.
-    
-    while iteration < total_iterations:
-        # If we've processed all files, reshuffle and restart.
-        if file_index >= num_files:
-            random.shuffle(pt_files)
-            file_index = 0
-        
-        current_file = pt_files[file_index]
-        file_index += 1
-        
+    # Train for the specified number of epochs
+    for epoch in range(num_epochs):
         if verbose:
-            print(f"Processing file: {current_file}")
-        try:
-            data = torch.load(current_file,weights_only=True)
-        except Exception as e:
-            print(f"Error loading {current_file}: {e}. Skipping this file.")
-            continue
+            print(f"Starting epoch {epoch+1}/{num_epochs}")
         
-        # Each file should contain a list of tuples:
-        # (state_tensor, UCI_move, move_index, result)
-        # For training, extract only (state_tensor, move_index)
-        training_samples = [(state, move_idx) for (state, uci_move, move_idx, result) in data]
-        random.shuffle(training_samples)
-        num_samples = len(training_samples)
-        sample_index = 0
+        # Shuffle the file list at the beginning of each epoch
+        random.shuffle(npz_files)
         
-        # Process mini-batches from the current file.
-        while sample_index + batch_size <= num_samples and iteration < total_iterations:
-            batch_samples = training_samples[sample_index: sample_index + batch_size]
-            sample_index += batch_size
-            loss = update_on_batch(model, optimizer, batch_samples)
-            iteration += 1
-            metrics["losses"].append(loss)
-            metrics["iterations"] = iteration
-            metrics["samples_processed"] += batch_size
-            
-            if verbose and iteration % 100 == 0:
-                print(f"Iteration {iteration}/{total_iterations}, Loss: {loss:.4f}, Samples processed: {metrics['samples_processed']}")
-            
-            if iteration % checkpoint_interval == 0:
-                if verbose:
-                    print(f"Checkpoint: {iteration} iterations processed. Saving model...")
-                save_models_and_metrics(policy_net=model, metrics=metrics, folder_name="real_data")
+        # Process each file in the shuffled order
+        for file_index, current_file in enumerate(npz_files):
+            if verbose:
+                print(f"Processing file {file_index+1}/{num_files}: {current_file}")
+            try:
+                # Load the file with batch processing
+                checkpoint = np.load(current_file)
+                
+                # Extract data without immediately converting to PyTorch tensors
+                states_np = checkpoint['states']
+                moves_np = checkpoint['moves']
+                
+                # Get total number of samples in this file
+                num_samples = len(states_np)
+                indices = list(range(num_samples))
+                random.shuffle(indices)
+                sample_index = 0
+                
+                # Process mini-batches from the current file
+                while sample_index + batch_size <= num_samples:
+                    # Get batch indices
+                    batch_indices = indices[sample_index: sample_index + batch_size]
+                    
+                    # Convert only the current batch to PyTorch tensors with proper types
+                    batch_states = torch.from_numpy(states_np[batch_indices]).to(device).float()
+                    batch_moves = torch.from_numpy(moves_np[batch_indices]).to(device).long()
+                    
+                    sample_index += batch_size
+                    
+                    # Update the model
+                    optimizer.zero_grad()
+                    policy_logits = model(batch_states)
+                    loss = F.cross_entropy(policy_logits, batch_moves)
+                    loss.backward()
+                    optimizer.step()
+                    
+                    loss_value = loss.item()
+                    
+                    iteration += 1
+                    metrics["losses"].append(loss_value)
+                    metrics["iterations"] = iteration
+                    metrics["samples_processed"] += batch_size
+                    
+                    if verbose and iteration % 100 == 0:
+                        print(f"Iteration {iteration}, Loss: {loss_value:.4f}, Samples processed: {metrics['samples_processed']}")
+                    
+                    if iteration % checkpoint_interval == 0:
+                        if verbose:
+                            print(f"Checkpoint: {iteration} iterations processed. Saving model...")
+                        save_models_and_metrics(policy_net=model, metrics=metrics, folder_name="simplified_real_data")
+                
+                # Process any leftover samples in the current file
+                if sample_index < num_samples:
+                    # Get batch indices
+                    batch_indices = indices[sample_index:]
+                    
+                    # Convert only the remaining batch to PyTorch tensors with proper types
+                    batch_states = torch.from_numpy(states_np[batch_indices]).to(device).float()
+                    batch_moves = torch.from_numpy(moves_np[batch_indices]).to(device).long()
+                    
+                    # Update the model
+                    optimizer.zero_grad()
+                    policy_logits = model(batch_states)
+                    loss = F.cross_entropy(policy_logits, batch_moves)
+                    loss.backward()
+                    optimizer.step()
+                    
+                    loss_value = loss.item()
+                    
+                    iteration += 1
+                    metrics["losses"].append(loss_value)
+                    metrics["iterations"] = iteration
+                    metrics["samples_processed"] += len(batch_indices)
+                    
+                    if verbose and iteration % 100 == 0:
+                        print(f"Iteration {iteration}, Loss: {loss_value:.4f}, Samples processed: {metrics['samples_processed']}")
+                    
+                    if iteration % checkpoint_interval == 0:
+                        if verbose:
+                            print(f"Checkpoint: {iteration} iterations processed. Saving model...")
+                        save_models_and_metrics(policy_net=model, metrics=metrics, folder_name="simplified_real_data")
+                
+                metrics["files_processed"] += 1
+                
+            except Exception as e:
+                print(f"Error loading {current_file}: {e}. Skipping this file.")
+                continue
         
-        # Process any leftover samples in the current file.
-        if sample_index < num_samples and iteration < total_iterations:
-            batch_samples = training_samples[sample_index:]
-            loss = update_on_batch(model, optimizer, batch_samples)
-            iteration += 1
-            metrics["losses"].append(loss)
-            metrics["iterations"] = iteration
-            metrics["samples_processed"] += len(batch_samples)
-            if verbose and iteration % 100 == 0:
-                print(f"Iteration {iteration}/{total_iterations}, Loss: {loss:.4f}, Samples processed: {metrics['samples_processed']}")
-            if iteration % checkpoint_interval == 0:
-                if verbose:
-                    print(f"Checkpoint: {iteration} iterations processed. Saving model...")
-                save_models_and_metrics(policy_net=model, metrics=metrics, folder_name="real_data")
+        # Update epoch tracking
+        metrics["epochs_completed"] += 1
+        if verbose:
+            print(f"Completed epoch {epoch+1}/{num_epochs}")
+            print(f"Total iterations: {iteration}, Total samples processed: {metrics['samples_processed']}")
     
     if verbose:
         print("Training complete. Saving final model...")
-    save_models_and_metrics(policy_net=model, metrics=metrics, folder_name="real_data")
+    save_models_and_metrics(policy_net=model, metrics=metrics, folder_name="simplified_real_data")
     
-    return metrics
+    return metrics, model
 
-# Replace with the path to your preprocessed .pt file.
-data_dir = r"pgn_checkpoints"
-pretrained_model = "real_data1\policy_net.pth"  # Or a valid path if you want to resume training.
-metrics = train_chess_network_from_preprocessed(
+# Example usage
+data_dir = r"pgn_checkpoints_compressed"
+pretrained_model = None  # Or a valid path if you want to resume training.
+metrics, trained_model = train_chess_network_from_preprocessed(
     data_dir=data_dir,
-    total_iterations=100000000,
-    batch_size=64,
-    lr=0.001,
-    layers=2,
-    checkpoint_interval=100000,
+    num_epochs=5,              # Number of complete passes through all data files
+    batch_size=124,
+    lr=0.0001,
+    layers=12,
+    checkpoint_interval=200000,
     pretrained_model_path=pretrained_model,
     verbose=True
 )

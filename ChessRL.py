@@ -205,8 +205,10 @@ class ChessRL:
         self.board_tensor = self.board_to_tensor(board)
 
 class ChessPositionalEvaluator(nn.Module):
-    def __init__(self, device='gpu'):
+    def __init__(self, device):
         super(ChessPositionalEvaluator, self).__init__()
+
+        self.device = device
         
         # Initialize opening, middlegame, and endgame tables
         self.phases = ['opening', 'middlegame', 'endgame']
@@ -334,17 +336,61 @@ class ChessPositionalEvaluator(nn.Module):
         elif piece_type == chess.KNIGHT:
             return (opening_w * self.knight_table_opening + 
                     mid_w * self.knight_table_middlegame + 
-                    end_w * self.knight_table_middlegame)  # Use middlegame for endgame too
-        # ... other pieces ...
+                    end_w * self.knight_table_endgame)
+        elif piece_type == chess.BISHOP:
+            return (opening_w * self.bishop_table_opening + 
+                    mid_w * self.bishop_table_middlegame + 
+                    end_w * self.bishop_table_endgame)
+        elif piece_type == chess.ROOK:
+            return (opening_w * self.rook_table_opening + 
+                    mid_w * self.rook_table_middlegame + 
+                    end_w * self.rook_table_endgame)
+        elif piece_type == chess.QUEEN:
+            return (opening_w * self.queen_table_opening + 
+                    mid_w * self.queen_table_middlegame + 
+                    end_w * self.queen_table_endgame)
         elif piece_type == chess.KING:
             return (opening_w * self.king_table_opening + 
                     mid_w * self.king_table_middlegame + 
                     end_w * self.king_table_endgame)
+        else:
+            # Default case to prevent None returns
+            return torch.zeros((8, 8), device=self.device)
     
     def forward(self, board_tensor, color):
         """Compute positional value using phase-specific tables"""
-        phase_weights = self.detect_game_phase(board_tensor)
+        # Cache phase weights and blended tables for repeated calls
+        if not hasattr(self, '_cached_phase') or self._cached_phase is None:
+            self._cached_phase = {}
+            self._cached_tables = {}
         
+        # Create a cache key based on material count
+        material_counts = []
+        for piece_type in range(1, 6):  # Exclude king
+            white_count = torch.sum(board_tensor[piece_type - 1]).item()
+            black_count = torch.sum(board_tensor[piece_type - 1 + 6]).item()
+            material_counts.append((piece_type, white_count, black_count))
+        
+        cache_key = tuple(material_counts)
+        
+        # Use cached phase weights and tables if available
+        if cache_key in self._cached_phase:
+            phase_weights = self._cached_phase[cache_key]
+            blended_tables = self._cached_tables[cache_key]
+        else:
+            # Calculate phase weights
+            phase_weights = self.detect_game_phase(board_tensor)
+            
+            # Precompute blended tables for all piece types
+            blended_tables = {}
+            for piece_type in range(1, 7):  # All pieces including king
+                blended_tables[piece_type] = self.get_blended_table(piece_type, phase_weights)
+            
+            # Cache results
+            self._cached_phase[cache_key] = phase_weights
+            self._cached_tables[cache_key] = blended_tables
+        
+        # Compute the final value tensor
         value_tensor = torch.zeros_like(board_tensor)
         for channel in range(12):
             piece_type = (channel % 6) + 1
@@ -354,7 +400,7 @@ class ChessPositionalEvaluator(nn.Module):
             material_val = self.piece_values[piece_type - 1]
             
             # Get blended table for this piece type
-            table = self.get_blended_table(piece_type, phase_weights)
+            table = blended_tables[piece_type]
             
             if is_white:
                 value_tensor[channel] = material_val + table
@@ -366,12 +412,13 @@ class ChessPositionalEvaluator(nn.Module):
         return total_value if color == chess.WHITE else -total_value
 
 class ChessPolicyNet(nn.Module, ChessRL):
-    def __init__(self, board, color, device,layers=5, epsilon=0.1,evaluator=None):
+    def __init__(self, board, color, device, layers=5, epsilon=0.1, evaluator=None):
         nn.Module.__init__(self)
         ChessRL.__init__(self, board, color)
         self.device = device
         self.epsilon = epsilon
 
+        # Create evaluator or use provided one
         self.evaluator = evaluator if evaluator is not None else ChessPositionalEvaluator(device)
 
         conv_layers = []
@@ -400,7 +447,7 @@ class ChessPolicyNet(nn.Module, ChessRL):
         self.policy_head = nn.Linear(512, num_actions)
         self.value_head = nn.Linear(512, 1)
 
-    def forward(self):
+    def forward(self,x=None):
         if x is None:
             x = self.board_tensor.to(self.device).unsqueeze(0)  # Add batch dimension
         
@@ -424,113 +471,233 @@ class ChessPolicyNet(nn.Module, ChessRL):
 
     def choose_move(self):
         """Selects a move using epsilon-greedy RL policy."""
-        probs,value,pos_value = self.forward()
+        # Get policy logits from the network
+        policy_logits, value, pos_value = self.forward()
+        
+        # Apply epsilon-greedy strategy
         if np.random.rand() < self.epsilon:
+            # Random move
             legal_moves = list(self.board.legal_moves)
             move = random.choice(legal_moves)
-            action_index = self.action_space.index(move)
-            log_prob = torch.log(probs[0, action_index] + 1e-8).to(self.device)
-            return move, log_prob
-
-        m = D.Categorical(probs)
-        action = m.sample()
-        action_index = action.item()
-        move = self.action_space[action_index]
-        log_prob = m.log_prob(action).to(self.device)
-        return move, log_prob
-
-
-    def reinforce_update(self, optimizer, game_histories, gamma=0.99, pos_alignment_weight=0.1):
-        """
-        Perform a REINFORCE update using a batch of game histories.
-        This updated version also trains the positional evaluator.
+            
+            # Create safe log probability
+            # Find the index for this move in the action space
+            try:
+                action_index = self.action_space.index(move)
+                # Create a small positive probability to avoid log(0)
+                safe_prob = 1e-6 + 1e-6 * policy_logits[0].detach().clone()
+                safe_prob[action_index] = 1.0 - safe_prob.sum() + safe_prob[action_index]
+                log_prob = torch.log(safe_prob[action_index]).to(self.device)
+                
+                # Safety check for NaN
+                if torch.isnan(log_prob):
+                    log_prob = torch.tensor([-10.0], device=self.device)  # Safe fallback
+                    
+            except ValueError:
+                # Move not in action space
+                log_prob = torch.tensor([-10.0], device=self.device)  # Safe fallback 
+                
+        else:
+            # Apply temperature to logits for better exploration
+            temperature = 1.0
+            scaled_logits = policy_logits[0] / temperature
+            
+            # Apply mask for legal moves
+            # Create a mask for legal moves
+            legal_move_mask = torch.zeros_like(scaled_logits)
+            for move in self.board.legal_moves:
+                try:
+                    idx = self.action_space.index(move)
+                    legal_move_mask[idx] = 1.0
+                except ValueError:
+                    continue
+                    
+            # Apply legal move mask (set illegal moves to large negative value)
+            if legal_move_mask.sum() > 0:  # At least one legal move in the action space
+                scaled_logits = scaled_logits * legal_move_mask + (1 - legal_move_mask) * -1e9
+                
+                # Create categorical distribution
+                # Use softmax with numerical stability
+                max_logit = scaled_logits.max()
+                exp_logits = torch.exp(scaled_logits - max_logit)
+                probs = exp_logits / (exp_logits.sum() + 1e-9)
+                
+                # Check for NaN or zero probs
+                if torch.isnan(probs).any() or (probs.sum() < 1e-6):
+                    # Fall back to uniform distribution over legal moves
+                    probs = legal_move_mask / (legal_move_mask.sum() + 1e-9)
+                
+                # Sample from the distribution
+                m = torch.distributions.Categorical(probs)
+                action = m.sample()
+                action_index = action.item()
+                
+                # Get the corresponding move
+                move = self.action_space[action_index]
+                
+                # Compute log probability safely
+                log_prob = m.log_prob(action).to(self.device)
+                
+                # Safety check for NaN
+                if torch.isnan(log_prob):
+                    log_prob = torch.tensor([-10.0], device=self.device)  # Safe fallback
+            else:
+                # No legal moves in action space - shouldn't happen but handle it
+                legal_moves = list(self.board.legal_moves)
+                move = random.choice(legal_moves)
+                log_prob = torch.tensor([-10.0], device=self.device)  # Safe fallback
         
-        Args:
-            optimizer: The optimizer for updating the network.
-            game_histories: A list where each element is a list of move dictionaries.
-                            Each move dictionary should contain:
-                            - "policy_info": a tensor (scalar or [1]) representing the log probability.
-                            - "reward": a scalar reward for that move.
-                            - "state": the board tensor at that move.
-            gamma: Discount factor.
-            pos_alignment_weight: Weight for the positional alignment loss term.
+        return move, log_prob, pos_value
+    
+    def load_state_dict(self, state_dict, strict=False):
+        # First try normal loading with strict=False
+        super().load_state_dict(state_dict, strict=False)
         
-        Returns:
-            The average loss (float) computed over the batch.
-        """
+        # Check if evaluator parameters were loaded
+        eval_params_loaded = any('evaluator' in k for k in state_dict.keys())
+        
+        # If no evaluator parameters were loaded and we need them, 
+        # create a fresh evaluator
+        if not eval_params_loaded and hasattr(self, 'evaluator') and self.evaluator is not None:
+            print("Warning: No evaluator parameters found in state dict. Using default evaluator.")
+
+
+    def reinforce_update(self, optimizer, game_histories, gamma=0.99, pos_alignment_weight=0.01):
         policy_losses = []
         pos_alignment_losses = []
 
         # Process each game individually.
-        for game in game_histories:
+        for game_idx, game in enumerate(game_histories):
             if len(game) == 0:
                 continue
 
-            # Extract log probabilities for each move.
-            log_probs = [move["policy_info"].squeeze() for move in game]
-            log_probs_tensor = torch.stack(log_probs)  # shape: [num_moves]
+            # Extract log probabilities for each move - ensure they're detached from previous computation
+            log_probs = []
+            for move in game:
+                # Make a fresh copy on the correct device
+                log_prob = move["policy_info"].squeeze().clone().detach().requires_grad_(True).to(self.device)
+                log_probs.append(log_prob)
             
-            # Extract rewards as a tensor.
-            rewards_tensor = torch.tensor([move["reward"] for move in game],
-                                        dtype=torch.float32,
-                                        device=self.device)
+            log_probs_tensor = torch.stack(log_probs)
+            
+            # Check for NaN values in log_probs
+            if torch.isnan(log_probs_tensor).any():
+                continue  # Skip this game if there are NaNs
+                
+            # Extract rewards
+            rewards = [move["reward"] for move in game]
+            rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=self.device)
 
             if rewards_tensor.numel() == 0:
                 continue
 
-            # For each state in the game, get the positional value
-            states = [move["state"] for move in game]
+            # Create states from scratch to avoid any reference issues
+            states = []
+            for move in game:
+                state = move["state"].clone().detach().to(self.device)
+                states.append(state)
             
             # Forward pass through the evaluator for each state
             pos_values = []
-            for state in states:
-                # Get the positional evaluation
-                with torch.enable_grad():  # Ensure we're tracking gradients
-                    pos_value = self.evaluator(state, self.color)
-                    pos_values.append(pos_value)
+            for state_idx, state in enumerate(states):
+                try:
+                    with torch.enable_grad():
+                        pos_value = self.evaluator(state, self.color)
+                        pos_values.append(pos_value)
+                except Exception as e:
+                    return 0.0  # Early exit on error
             
             pos_values_tensor = torch.stack(pos_values)
             
-            # Create discount factors: [1, gamma, gamma^2, ...]
-            discounts = torch.tensor([gamma ** i for i in range(len(rewards_tensor))],
-                                    dtype=torch.float32,
-                                    device=self.device)
-            # Compute discounted rewards and cumulative returns.
+            # Check for NaN in positional values
+            if torch.isnan(pos_values_tensor).any():
+                continue
+            
+            # Create discount factors safely
+            discounts = torch.tensor([gamma ** i for i in range(len(rewards_tensor))], 
+                                    dtype=torch.float32, device=self.device)
+            
+            # Compute discounted rewards and returns
             discounted_rewards = rewards_tensor * discounts
-            returns = torch.flip(torch.cumsum(torch.flip(discounted_rewards, dims=[0]), dim=0), dims=[0])
             
-            # Normalize returns for this game.
-            returns = (returns - returns.mean()) / (returns.std() + 1e-9)
+            # Use a safe cumulative sum by creating a fresh tensor
+            flipped_rewards = torch.flip(discounted_rewards, dims=[0])
+            cumsum = torch.zeros_like(flipped_rewards)
+            for i in range(len(flipped_rewards)):
+                if i == 0:
+                    cumsum[i] = flipped_rewards[i]
+                else:
+                    cumsum[i] = cumsum[i-1] + flipped_rewards[i]
             
-            # Compute policy gradient loss
-            policy_loss = (-log_probs_tensor * returns).mean()
+            returns = torch.flip(cumsum, dims=[0])
+            
+            # Check for NaN in returns
+            if torch.isnan(returns).any():
+                continue
+            
+            # Normalize returns carefully
+            mean_val = returns.mean().item()
+            std_val = max(returns.std().item(), 1e-9)  # Prevent division by zero
+            normalized_returns = torch.zeros_like(returns)
+            for i in range(len(returns)):
+                normalized_returns[i] = (returns[i].item() - mean_val) / std_val
+            
+            # Check for NaN in normalized returns
+            if torch.isnan(normalized_returns).any():
+                continue
+            
+            # Compute policy gradient loss carefully
+            products = -log_probs_tensor * normalized_returns
+            if torch.isnan(products).any():
+                continue
+                
+            policy_loss = products.mean()
             policy_losses.append(policy_loss)
             
-            # Compute alignment loss between positional values and returns
-            # This encourages the positional evaluator to predict expected returns
-            pos_alignment_loss = F.mse_loss(pos_values_tensor, returns)
-            pos_alignment_losses.append(pos_alignment_loss)
+            # Compute alignment loss
+            try:
+                pos_alignment_loss = F.mse_loss(pos_values_tensor, normalized_returns)
+                pos_alignment_losses.append(pos_alignment_loss)
+            except Exception:
+                continue
 
         if len(policy_losses) == 0:
-            print("No move history found! Skipping update.")
             return 0.0
 
-        # Average the losses over all games.
+        # Average the losses carefully
         avg_policy_loss = torch.stack(policy_losses).mean()
-        avg_pos_alignment_loss = torch.stack(pos_alignment_losses).mean() if pos_alignment_losses else 0
+        avg_pos_alignment_loss = torch.stack(pos_alignment_losses).mean() if pos_alignment_losses else torch.tensor(0.0, device=self.device)
         
         # Combine losses
         total_loss = avg_policy_loss + pos_alignment_weight * avg_pos_alignment_loss
 
         optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
+        
+        # Add gradient clipping
+        parameters = [p for p in self.parameters() if p.requires_grad]
+        torch.nn.utils.clip_grad_norm_(parameters, max_norm=0.5)
+        
+        try:
+            total_loss.backward()
+            
+            # Check for NaN gradients after backward
+            has_nan_grad = False
+            for name, param in self.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    has_nan_grad = True
+                    break
+                    
+            if not has_nan_grad:
+                optimizer.step()
+            
+        except Exception:
+            return 0.0
 
+        # Only print the final result
         print(f"REINFORCE policy loss: {avg_policy_loss.item():.4f}, "
             f"Position alignment loss: {avg_pos_alignment_loss.item():.4f}")
-        
-        return total_loss.item()
 
+        return total_loss.item()
 
 # class ChessHybridNet(nn.Module, ChessRL):
 #     def __init__(self, board, color, device, layers=2, epsilon=0.1, evaluator=None):
